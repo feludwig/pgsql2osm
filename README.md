@@ -27,27 +27,34 @@ and `planet_osm_point` tables
 Features
 ---
 
-* XML streaming output, allows to store compressed .osm.bz2 on disk. example:
+* XML streaming output, allows to only store compressed .osm.bz2 on disk. example:
 
 
 `pgsql2osm.py --dsn 'user=username dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2`
 * Attempt to lower RAM footprint with generators for database queries
 * Automatic detection of the middle database format (legacy text[] or new jsonb,
-available in dbs created by osm2pgsql>=1.9)
+available in databases created by osm2pgsql>=1.9)
 * Automatic detection of `planet_osm_point`, `planet_osm_line` and
-`planet_osm_polygon` columns: a specific .style as import is not required
+`planet_osm_polygon` columns: a specific `.style` at import is not required
 * Bounds specifiable as _either_ :
   - iso country or region code `--iso de-by` for Germany/Bayern
-    `grep -i malaysia regions.csv` can show you recognized iso codes for Malaysia
+    * `grep -i malaysia regions.csv` can show you recognized iso codes for Malaysia
   - osm relation id `--osm-rel-id N`, for any relation in the database.
-You can look at a relation at
-[https://www.openstreetmap.org/relation/<N>](https://www.openstreetmap.org/relation/51701)
-Switzerland
   - geojson polygon input file `--geojson file.geojson`
   - bounding box `--box='<lon_from>,<lat_from>,<lon_to>,<lat_to>'`
 
+### Benchmarks 
+
+* Example export of `switzerland.osm.bz2` takes about 2 hours, the database access
+uses a constant 4-6GB RAM and the script itself reaches about 4GB RAM. Output is
+then about 1GB when bzip2-compressed
+* Germany-Bavaria in 2.5h and `.osm.bz2` is 1.8GB.
+
 Disclaimer
 ---
+
+### Outside of bounds geometries
+The bounding region will include every entity and all its dependent entities. This also means entities outside the boundary will be inlcuded. No geometry clipping is taking place, features are exported as-is.
 
 ### Output may change
 This is experimental, data output may change to work better with other `.osm`-accepting tools.
@@ -58,8 +65,8 @@ Currently, uncompressed `.osm` output files bigger than about a gigabyte error o
 
 ### Unreliable
 The output data may have some missing attributes, because the database import
-is not a lossless operation: importing a .osm.pbf to database, then exporting
-it to .osm and then converting it back to .osm.pbf will produce a **different** file.
+is not a lossless operation: importing a `.osm.pbf` to database, then exporting
+it to `.osm` and then converting it back to `.osm.pbf` will produce a **different** file.
 
 
 The data from the database is straightforwardly reinterpreted to mean key=value
@@ -98,3 +105,7 @@ Implementation details
 
 _Note_ : only admin_level<=4 is loaded into `regions.csv`.
 Use a search on [openstreetmap.org](openstreetmap.org) for smaller regions.
+And then extract the relation id from the url:
+[https://www.openstreetmap.org/relation/\<N\>](https://www.openstreetmap.org/relation/51701)
+eg Switzerland
+
