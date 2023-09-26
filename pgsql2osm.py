@@ -105,21 +105,27 @@ async def chain(*generators:typing.Iterator)->typing.Iterator:
             async for i in g :
                 yield i
 
-async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int])->typing.Iterator :
+async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
+        args:argparse.Namespace)->typing.Iterator :
     #beware, need to exchange lonlat -> latlon
-    osm_ids=list(osm_ids) #for the range-indexing
-    a=await asyncio.create_subprocess_exec('/home/user/src/osm2pgsql/build/get_lonlat',
-        '/mnt/dbp/maps/planet.bin.nodes',
+    a=await asyncio.create_subprocess_exec(args.get_lonlat_binary,
+        args.nodes_file,
         stdout=asyncio.subprocess.PIPE,stdin=asyncio.subprocess.PIPE)
-    # some osm_ids may error out. in that case get_lonlat just ignores them. therefore, take the output
-    # osm_id as source of truth.
-    a.stdin.write((' '.join(map(str,osm_ids))).encode())
+    # some osm_ids may error out. in that case get_lonlat just ignores them.
+    # therefore, take the output osm_id as source of truth.
+
+    # the last character is important: NOT number data but a separator.
+    for i in osm_ids :
+        a.stdin.write((str(i)+'\n').encode())
+    #just to be sure
+    a.stdin.write(b'\n')
     a.stdin.close()
     #read all results
     while (line:=(await a.stdout.readline()).strip().decode()) :
         #l.log('read line',line)
         x,y,osm_id=line.split(';')
         yield (osm_id,y,x)
+
 
 def all_nwr_within(c:psycopg2.extensions.cursor,accumulator:dict,args:argparse.Namespace) :
     from_rel_id=False
@@ -476,10 +482,7 @@ async def stream_osm_xml(c:psycopg2.extensions.cursor,args:argparse.Namespace) :
     the given bounds. But the dependencies are sometimes required, so more data that just
     within the bounds will be included. Currently, no geometric features are clipped in
     any way.
-    The args.bounds can describe a multitude of formats:
-        * <rel_id_integer> will fetch the bounding box from database
-        * <filename_of_geojson> will read the geojson description
-        * <lon_from>,<lat_from>,<lon_to>,<lat_to> will make a rectangle.
+    See --help for args.bounds.
     '''
     with_parents=False
     phases=['within','parents','children','write']
@@ -503,18 +506,19 @@ async def stream_osm_xml(c:psycopg2.extensions.cursor,args:argparse.Namespace) :
     counts=[len(accumulator[i])for i in ('nodes','ways','rels')]
     l.log('dumping',counts[0],'nodes,',counts[1],'ways,',counts[2],'rels in total')
 
-    # ONLY after all ids have been resolved, do we actually query the data, RAM-inefficient otherwise
-    # more RAM-inefficient for bigger extracts. do more of a streaming from database to file approach
-    l.next_phase() #query
+    # ONLY after all ids have been resolved, do we actually query the data,
+    # RAM-inefficient otherwise; more RAM-inefficient for bigger extracts.
+    # do more of a streaming from database to file approach
+    l.next_phase() #write
     out_file=sys.stdout.buffer if args.out_file=='-' else args.out_file
     with lxml.etree.xmlfile(out_file,encoding='utf-8') as xml_out :
         xml_out.write_declaration()
         with xml_out.element('osm',{
                 'version':'0.6',
-                'generator':time.strftime('psql2osm.py %F')
+                'generator':time.strftime('https://github.com/feludwig/pgsql2osm/pgsql2osm.py %F')
         }) :
             async for el in chain(
-                    create_nodes(c,list(accumulator['nodes'])),
+                    create_nodes(c,list(accumulator['nodes']),args),
                     create_ways(c,list(accumulator['ways'])),
                     create_relations(c,list(accumulator['rels'])),
             ) :
@@ -721,7 +725,8 @@ def get_columns_of_types(c:psycopg2.extensions.cursor,
     for colname,strtype in c.fetchall() :
         yield table_name+'.'+('"'+colname+'"' if colname.find(':')>0 else colname)
 
-async def create_nodes(c:psycopg2.extensions.cursor,ids:list)->typing.Iterator[ET.Element] :
+async def create_nodes(c:psycopg2.extensions.cursor,ids:list,
+        args:argparse.Namespace)->typing.Iterator[ET.Element] :
     table_name='planet_osm_point'
     l.log(0,'/',len(ids),'nodes, reading table',table_name,'...',clearline=True)
     read_columns=[f'{table_name}.osm_id AS id',
@@ -757,10 +762,7 @@ async def create_nodes(c:psycopg2.extensions.cursor,ids:list)->typing.Iterator[E
     #            yield node_id
     count=len(done_nodes)+0
     for batch in g_batches((i for i in ids if i not in done_nodes),5_000) :
-        #async with get_latlon_str_from_flatnodes(batch) as simple_nodes :
-        #print('get_lonlat finished',len(ids)-len(done_nodes))
-        #async for osm_id,lat,lon in simple_nodes :
-        async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch) :
+        async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch,args) :
             yield ET.Element('node',{'id':str(osm_id),'lat':lat,'lon':lon})
             count+=1
             if count%16==0 :
@@ -780,6 +782,16 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
             current_batch=set()
     if len(current_batch)!=0 :
         yield current_batch
+
+async def test(args:argparse.Namespace) :
+    ''' Test: checks if get_lonlat exsits, is executable.
+        And the get_lonlat execution will crash if planet.bin.nodes is
+        not readwrite or does not exist.
+    '''
+    result=[]
+    async for i in get_latlon_str_from_flatnodes(('2185493801','3546766428'),args) :
+        result.append(i)
+    return result
 
 l=Logger() #global variable
 
@@ -833,6 +845,8 @@ if __name__=='__main__' :
         assert len(t_schema)==2, 'Could not decide which middle db schema is used'
 
     print('INFO:','detected middle database layout:','new jsonb' if new_jsonb_schema else 'legacy text[]',file=sys.stderr)
+
+    asyncio.run(test(args))
+
     print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
     t=asyncio.run(stream_osm_xml(access.cursor(),args))
-    #ET.ElementTree(t).write(sys.argv[3],encoding='utf-8',xml_declaration=True)
