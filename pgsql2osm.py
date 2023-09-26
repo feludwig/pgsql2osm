@@ -11,9 +11,12 @@ import os
 import json
 import asyncio
 
+import sys
+import argparse
+
 def regions_lookup(isocode:str) :
     isocode=isocode.upper().replace('_','-')
-    with open('regions.csv') as f:
+    with open(os.path.dirname(__file__)+'/regions.csv') as f:
         regions=f.read().strip().split('\n')
     headers=regions.pop(0).split(',')
     search_cols=[]
@@ -118,27 +121,30 @@ async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int])->typing.
         x,y,osm_id=line.split(';')
         yield (osm_id,y,x)
 
-def all_nwr_within(c:psycopg2.extensions.cursor,accumulator:dict,bbox:str) :
+def all_nwr_within(c:psycopg2.extensions.cursor,accumulator:dict,args:argparse.Namespace) :
     from_rel_id=False
-    if os.path.exists(bbox) :
-        with open(bbox,'r') as f :
+    if args.bounds_geojson!=None :
+        with open(args.bounds_geojson,'r') as f :
             geojson=f.read().strip()
         way_constr=f"ST_GeomFromGeoJSON('{geojson}'::jsonb)"
         way_constr_a=f'way&&ST_Transform({way_constr},3857)'
         way_constr_b=f'ST_Intersects(way,ST_Transform({way_constr},3857))'
-    elif bbox.find('osm_rel_id:')==0 :
-        osm_rel_id=int(bbox.split('osm_rel_id:')[1])
+    elif args.bounds_rel_id!=None :
+        osm_rel_id=args.bounds_rel_id
         from_rel_id=True
-    elif bbox.find('iso:')==0 :
-        c_code=bbox.split('iso:')[1]
-        c_name,osm_rel_id=regions_lookup(c_code)
+    elif args.bounds_iso!=None :
+        c_name,osm_rel_id=regions_lookup(args.bounds_iso)
         l.log(f"Suggested output filename: '{c_name}.osm'")
         osm_rel_id=int(osm_rel_id)
         from_rel_id=True
-    else :
-        lon_from,lat_from,lon_to,lat_to=tuple(map(float,bbox.split(',')))
+    elif args.bounds_box!=None :
+        lon_from,lat_from,lon_to,lat_to=tuple(map(float,args.bounds_box.split(',')))
         way_constr_a=f'way&&ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857)'
         way_constr_b=f'ST_Intersects(way,ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857))'
+    else :
+        l.log('Error: no boundary provided.')
+        l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
+        exit(1)
     if from_rel_id :
         #relation ids are stored negative
         way_constr_a=f'way&&(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
@@ -464,14 +470,14 @@ def ways_children_n(c:psycopg2.extensions.cursor,accumulator:dict) :
     l.log('collected',node_count,'nodes,','children of',len(accumulator['ways']),'ways')
 
 
-async def stream_osm_xml(c:psycopg2.extensions.cursor,out_file:str,bbox:typing.Any) :
+async def stream_osm_xml(c:psycopg2.extensions.cursor,args:argparse.Namespace) :
     ''' Query osm2pgsql-imported postgres database for nodes, ways and rels and stream
-    an xml representation of them into out_file. Attempts to select objects that are in
-    the given bbox. But the dependencies are sometimes required, so more data that just
+    an xml representation of them into args.out_file. Attempts to select objects that are in
+    the given bounds. But the dependencies are sometimes required, so more data that just
     within the bounds will be included. Currently, no geometric features are clipped in
     any way.
-    The bbox:str can describe a multitude of formats:
-        * osm_rel_id:<rel_id_integer> will fetch the bounding box from database
+    The args.bounds can describe a multitude of formats:
+        * <rel_id_integer> will fetch the bounding box from database
         * <filename_of_geojson> will read the geojson description
         * <lon_from>,<lat_from>,<lon_to>,<lat_to> will make a rectangle.
     '''
@@ -483,7 +489,7 @@ async def stream_osm_xml(c:psycopg2.extensions.cursor,out_file:str,bbox:typing.A
     #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
     accumulator={'nodes':set(),'ways':set(),'rels':set()}
 
-    all_nwr_within(c,accumulator,bbox)
+    all_nwr_within(c,accumulator,args)
     if with_parents :
         l.next_phase() #parents
         nodes_parent_wr(c,accumulator)
@@ -500,10 +506,7 @@ async def stream_osm_xml(c:psycopg2.extensions.cursor,out_file:str,bbox:typing.A
     # ONLY after all ids have been resolved, do we actually query the data, RAM-inefficient otherwise
     # more RAM-inefficient for bigger extracts. do more of a streaming from database to file approach
     l.next_phase() #query
-    if out_file=='-' :
-        import io
-        #out_file=io.TextIOWrapper(sys.stdout.buffer)
-        out_file=sys.stdout.buffer
+    out_file=sys.stdout.buffer if args.out_file=='-' else args.out_file
     with lxml.etree.xmlfile(out_file,encoding='utf-8') as xml_out :
         xml_out.write_declaration()
         with xml_out.element('osm',{
@@ -781,8 +784,45 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
 l=Logger() #global variable
 
 if __name__=='__main__' :
-    import sys
-    access=psycopg2.connect(sys.argv[1])
+
+    parser=argparse.ArgumentParser(prog='pgsql2osm')
+
+    parser.add_argument('get_lonlat_binary',
+        help="Path to the get_lonlat binary")
+    parser.add_argument('nodes_file',
+        help='Path to the nodes file created by osm2pgsql at import')
+    parser.add_argument('-d','--dsn',
+        dest='postgres_dsn',
+        help="The connection string to pass to psycopg2 eg 'host=localhost dbname=gis' port=5432",
+        default='dbname=gis')
+    #one of the following:
+    parser.add_argument('-b','--bbox',
+        dest='bounds_box',
+        default=None,
+        type=str,
+        help='Rectangle boundary in the format lon_from,lat_from,lon_to,lat_to')
+    parser.add_argument('-r','--osm-rel-id',
+        dest='bounds_rel_id',
+        default=None,
+        help='Integer for the osm relation that should make the boundary',
+        type=int)
+    parser.add_argument('-i','--iso',
+        dest='bounds_iso',
+        default=None,
+        help='Country or region code for looking up in regions.csv, to determine boundary')
+    parser.add_argument('-g','--geojson',
+        dest='bounds_geojson',
+        default=None,
+        help='Geojson file for determining the boundary')
+
+    parser.add_argument('-o','--output',
+        dest='out_file',
+        help="Path where the output .osm should be written to. When '-', write to stdout",
+        required=True)
+
+
+    args=parser.parse_args()
+    access=psycopg2.connect(args.postgres_dsn)
     other_cursor=access.cursor()
     j_schema=list(get_columns_of_types(other_cursor,('jsonb',),'planet_osm_rels'))
     t_schema=list(get_columns_of_types(other_cursor,('_text',),'planet_osm_rels'))
@@ -794,5 +834,5 @@ if __name__=='__main__' :
 
     print('INFO:','detected middle database layout:','new jsonb' if new_jsonb_schema else 'legacy text[]',file=sys.stderr)
     print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
-    t=asyncio.run(stream_osm_xml(access.cursor(),sys.argv[3],sys.argv[2]))
+    t=asyncio.run(stream_osm_xml(access.cursor(),args))
     #ET.ElementTree(t).write(sys.argv[3],encoding='utf-8',xml_declaration=True)
