@@ -32,6 +32,10 @@ Features
   - geojson input file `--geojson file.geojson`
   - bounding box `--box='<lon_from>,<lat_from>,<lon_to>,<lat_to>'`
 
+Disclaimer
+---
+This is experimental, data output may change to work better with other .osm-accepting tools.
+Currently, uncompressed .osm output files bigger than about a gigabyte error out with OsmAndMapCreator.
 
 Installation
 ---
