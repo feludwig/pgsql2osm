@@ -63,7 +63,7 @@ This is experimental, data output may change to work better with other `.osm`-ac
 ### Errors
 Currently, uncompressed `.osm` output files bigger than about a gigabyte error out with `OsmAndMapCreator`.
 
-### Unreliable
+### Unreliable data
 The output data may have some missing attributes, because the database import
 is not a lossless operation: importing a `.osm.pbf` to database, then exporting
 it to `.osm` and then converting it back to `.osm.pbf` will produce a **different** file.
