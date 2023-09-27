@@ -75,19 +75,22 @@ class Settings :
             if 'geom' in row_dict :
                 self.tables[n_end]['srid']=row_dict['srid']
                 self.tables[n_end]['geom']=row_dict['geom']
+
+        if self.debug :
+            print('s.tables=',self.tables,file=sys.stderr)
         for key in ('_point','_line','_polygon','_ways','_rels') :
             assert key in self.tables and isinstance(self.tables[key],dict), 'Could not autodetect which tables contain the data'
-            
-        j_schema=list(get_columns_of_types(self.c,('jsonb',),'planet_osm_rels'))
-        t_schema=list(get_columns_of_types(self.c,('_text',),'planet_osm_rels'))
+
+        j_schema=list(get_columns_of_types(self.c,('jsonb',),self.tables['_rels']['name']))
+        t_schema=list(get_columns_of_types(self.c,('_text',),self.tables['_rels']['name']))
         self.new_jsonb_schema=len(j_schema)==2
+        if self.debug:
+            print('t_schema=',t_schema,'j_schema',j_schema,file=sys.stderr)
         if self.new_jsonb_schema :
             assert len(t_schema)==0, 'Could not decide which middle db schema is used'
         else :
             assert len(t_schema)==2, 'Could not decide which middle db schema is used'
 
-        if self.debug :
-            print('s.tables=',self.tables,file=sys.stderr)
         print('INFO:','detected middle database layout:','new jsonb' if self.new_jsonb_schema else 'legacy text[]',file=sys.stderr)
         asyncio.run(self.test())
         print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
@@ -241,8 +244,8 @@ async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
 
 def all_nwr_within(s:Settings,accumulator:dict) :
     # 1a) select all nodes WHERE way ST_Within(bbox);
-    l.log('executing big query on planet_osm_point...',clearline=True)
     constr,tbl_name=s.make_bounds_constr('_point')
+    l.log('executing big query on',tbl_name,'...',clearline=True)
     s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
     for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         accumulator['nodes'].add(row['osm_id'])
@@ -537,14 +540,14 @@ def rels_children_nwr(s:Settings,accumulator:dict,only_multipolygon_rels=False,w
     l.log('collected',node_count,'nodes,',way_count,'ways,',rel_count,'rels',
         'children of',len(accumulator['rels']),'rels')
 
-def ways_children_n(c:psycopg2.extensions.cursor,accumulator:dict) :
+def ways_children_n(s:Settings,accumulator:dict) :
     # 4b) foreach way_id: add all its nodes[] ids
     way_count=0
     node_count=0
     for way_id in accumulator['ways'] :
         way_count+=1
-        c.execute(f'SELECT nodes FROM planet_osm_ways WHERE id={way_id};')
-        for row in g_from_cursor(c) :
+        s.c.execute(f'SELECT nodes FROM {s.tables["_ways"]["name"]} WHERE id={way_id};')
+        for row in g_from_cursor(s.c) :
             for i in row['nodes'] :
                 accumulator['nodes'].add(i)
                 node_count+=1
@@ -581,7 +584,7 @@ async def stream_osm_xml(s:Settings) :
     # do we want big forests ? yes even outside the bounds
     ## TODO: move config to Settings
     rels_children_nwr(s,accumulator,only_multipolygon_rels=True,without_rels=True)
-    ways_children_n(s.c,accumulator)
+    ways_children_n(s,accumulator)
 
     counts=[len(accumulator[i])for i in ('nodes','ways','rels')]
     l.log('dumping',counts[0],'nodes,',counts[1],'ways,',counts[2],'rels in total')
@@ -641,7 +644,7 @@ def rel_to_xml(row_dict:dict,new_jsonb_schema:bool)->ET.Element :
 def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     tbl_rels=s.tables['_rels']['name']
     table_name=s.tables['_polygon']['name']
-    l.log(0,'/',len(ids),'rels, reading table',table_name,'...',clearline=True)
+    l.log(0,'/',len(ids),'rels, reading table',table_name,'...')
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         # we need to merge the _polygon tags with the _rels tags.
@@ -655,7 +658,7 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     ]
     query='SELECT '+(','.join(read_columns))
     query+=f',{tbl_rels}.members FROM {table_name} JOIN {tbl_rels}'
-    query+=f' ON -{table_name}.osm_id=planet_osm_rels.id'
+    query+=f' ON -{table_name}.osm_id={tbl_rels}.id'
 
     # the JOIN makes this query incredibly slow...
     # BUT ONLY "ON osm_id=-id", and "ON -osm_id=id" is fast...
@@ -666,24 +669,51 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     # osm_id IN (-id1,-id2,-id3) is fast. But it needs some more memory in python to
     # store the negatives copy as well
     for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
+        if row_dict['id'] in done_ids :
+            continue
         yield rel_to_xml(row_dict,s.new_jsonb_schema)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
+
+    #and now with _line as well
+    table_name=s.tables['_line']['name']
+    l.log(len(done_ids),'/',len(ids),'rels, reading table',table_name,'...')
+
+    read_columns=[f'-{table_name}.osm_id AS id',
+        f'hstore_to_json({table_name}.tags) AS json_tags',
+        f'{tbl_rels}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2',
+        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+    ]
+    query='SELECT '+(','.join(read_columns))
+    query+=f',{tbl_rels}.members FROM {table_name} JOIN {tbl_rels}'
+    query+=f' ON -{table_name}.osm_id={tbl_rels}.id'
+
+    # the JOIN makes this query incredibly slow...
+    # BUT ONLY "ON osm_id=-id", and "ON -osm_id=id" is fast...
+
+    done_ids=set()
+    # psql does not have an index on -osm_id and does not understand *=-1 is bijective.
+    #therevore  checking -osm_id IN (id1,id2,id3) is super slow, but
+    # osm_id IN (-id1,-id2,-id3) is fast. But it needs some more memory in python to
+    # store the negatives copy as well
+    for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
+        if row_dict['id'] in done_ids :
+            continue
+        yield rel_to_xml(row_dict,s.new_jsonb_schema)
+        done_ids.add(row_dict['id'])
+        l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
+
     missing_ids=set()
     for i in ids :
         if i not in done_ids :
             missing_ids.add(i)
 
-    #TODO: I forgot about planet_osm_line...
-
-
     table_name=tbl_rels
-    l.log(len(done_ids),'/',len(ids),prependline=True)
-    l.log('rels: still',len(missing_ids),'missing, reading table',table_name)
-    #in this table, tags is ::text[], not a hstore
+    l.log(len(done_ids),'/',len(ids),'rels, reading table',table_name,'...')
     if s.new_jsonb_schema :
         query=f'SELECT id,members,tags AS json_tags FROM {table_name}'
     else :
+        #in this table, tags is ::text[], not a hstore
         query=f'SELECT id,members,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
     count=len(done_ids)+0
     #bigger step than previous, because there is (heurisitcally) less data for these "tagless" relations
@@ -715,7 +745,7 @@ def way_to_xml(row_dict:dict)->ET.Element :
 def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     tbl_ways=s.tables['_ways']['name']
     table_name=s.tables['_polygon']['name']
-    l.log(0,'/',len(ids),'ways, reading table',table_name,'...',clearline=True)
+    l.log(0,'/',len(ids),'ways, reading table',table_name,'...')
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags', #polygons stores a hstore even in the new_jsonb_schema
         f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
@@ -725,24 +755,44 @@ def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))
-    query+=f',planet_osm_ways.nodes FROM {table_name} JOIN {tbl_ways}'
+    query+=f',{tbl_ways}.nodes FROM {table_name} JOIN {tbl_ways}'
     query+=f' ON {table_name}.osm_id={tbl_ways}.id'
 
     done_ids=set()
     for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
+        if row_dict['id'] in done_ids :
+            continue
         yield way_to_xml(row_dict)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'ways','    ',percent(len(done_ids),len(ids)),clearline=True)
+
+    #and now with _line
+    table_name=s.tables['_line']['name']
+    l.log(len(done_ids),'/',len(ids),'ways, reading table',table_name,'...')
+    read_columns=[f'{table_name}.osm_id AS id',
+        f'hstore_to_json({table_name}.tags) AS json_tags',
+        f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
+        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+    ]
+    query='SELECT '+(','.join(read_columns))
+    query+=f',{tbl_ways}.nodes FROM {table_name} JOIN {tbl_ways}'
+    query+=f' ON {table_name}.osm_id={tbl_ways}.id'
+
+    for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
+        if row_dict['id'] in done_ids :
+            continue
+        yield way_to_xml(row_dict)
+        done_ids.add(row_dict['id'])
+        l.log(len(done_ids),'/',len(ids),'ways','    ',percent(len(done_ids),len(ids)),clearline=True)
+
     missing_ids=set()
     for i in ids :
         if i not in done_ids :
             missing_ids.add(i)
 
-    #TODO: forgot about planet_osm_line
-
+    #everything else was queried, only _ways remains
     table_name=tbl_ways
-    l.log(len(done_ids),'/',len(ids),prependline=True)
-    l.log('ways: still',len(missing_ids),'missing, reading table',table_name)
+    l.log(len(done_ids),'/',len(ids),'ways, reading table',table_name,'...')
     #in this table, tags::text[], not yet a hstore
     if s.new_jsonb_schema :
         query=f'SELECT id,nodes,tags AS json_tags FROM {table_name}'
@@ -790,14 +840,18 @@ def g_query_ids(c:psycopg2.extensions.cursor,query:str,
         yield from g_from_cursor(c)
 
 def get_columns_of_types(c:psycopg2.extensions.cursor,
-        col_types:typing.Collection[str],table_name:str)->typing.Iterator[str] :
+        col_types:typing.Collection[str],table_full_name:str)->typing.Iterator[str] :
     values_col_types=",".join(["'"+i+"'" for i in col_types])
+    schema_name,table_name=table_full_name.strip('"').split('.')
     c.execute(f'''
     SELECT colname,strtype FROM 
         (SELECT attname AS colname,
             (SELECT typname FROM pg_type WHERE oid=atttypid) AS strtype
         FROM pg_attribute WHERE attrelid=
-            (SELECT oid FROM pg_class WHERE relname='{table_name}')
+            (SELECT oid FROM pg_class WHERE relname='{table_name}'
+            AND relnamespace=(SELECT oid FROM pg_namespace
+                WHERE nspname='{schema_name}'
+            ))
         ) AS columns
     WHERE strtype IN ({values_col_types})
         AND colname NOT IN ('osm_id');''')
@@ -895,6 +949,7 @@ if __name__=='__main__' :
         required=True)
 
     parser.add_argument('--debug',dest='debug',default=False,
+        action='store_true',
         help='Show additional debugging information')
 
 
