@@ -1,9 +1,6 @@
 #!/usr/bin/python3
 
-#import xml.etree.ElementTree as ET
 import lxml.etree as ET
-# for streaming xml output, reduces ram footprint
-import lxml.etree
 import time
 import psycopg2
 import typing
@@ -31,6 +28,123 @@ def regions_lookup(isocode:str) :
                     return r_d[headers.index('name')],r_d[headers.index('osm_id')]
     print('Error iso boundary not found:',isocode)
     exit(1)
+
+class Settings :
+    def __init__(self,args:argparse.Namespace) :
+        self.debug=args.debug
+
+        self.bounds_geojson=args.bounds_geojson
+        self.bounds_rel_id=args.bounds_rel_id
+        self.bounds_iso=args.bounds_iso
+        self.bounds_box=args.bounds_box
+
+        self.get_lonlat_binary=args.get_lonlat_binary
+        self.nodes_file=args.nodes_file
+
+        self.out_file=args.out_file
+        
+        self.access=psycopg2.connect(args.postgres_dsn)
+        #use one cursor for everything
+        self.c=self.access.cursor()
+        self.c.execute('''SELECT f_table_name AS name,f_table_schema AS schema,
+                f_geometry_column AS geom,srid,
+                pg_table_size(f_table_name::text) AS size
+            FROM geometry_columns WHERE srid!=0''')
+        autodetect_tables=list(g_from_cursor(self.c))
+        self.c.execute('''SELECT tablename AS name,schemaname AS schema,
+                pg_table_size(tablename::text) AS size
+            FROM pg_tables WHERE schemaname NOT IN ('information_schema','pg_catalog')''')
+        autodetect_tables.extend(list(g_from_cursor(self.c)))
+        self.tables={}
+        geom_name_endings=('_point','_line','_polygon')
+        nongeom_name_endings=('_ways','_rels')
+        for row_dict in autodetect_tables :
+            name=row_dict['name']
+            n_end=None
+            test_endings=geom_name_endings if 'geom' in row_dict else nongeom_name_endings
+            for test_name_end in test_endings :
+                if name.endswith(test_name_end) :
+                    n_end=test_name_end
+            print(name)
+            if n_end==None :
+                continue
+            name=row_dict['schema']+'.'+row_dict['name']
+            if n_end in self.tables and self.tables[n_end]['size']>row_dict['size']:
+                continue #take the biggest size table
+            self.tables[n_end]={'name':name,'size':row_dict['size']}
+            if 'geom' in row_dict :
+                self.tables[n_end]['srid']=row_dict['srid']
+                self.tables[n_end]['geom']=row_dict['geom']
+        for key in ('_point','_line','_polygon','_ways','_rels') :
+            assert key in self.tables and isinstance(self.tables[key],dict), 'Could not autodetect which tables contain the data'
+            
+        j_schema=list(get_columns_of_types(self.c,('jsonb',),'planet_osm_rels'))
+        t_schema=list(get_columns_of_types(self.c,('_text',),'planet_osm_rels'))
+        self.new_jsonb_schema=len(j_schema)==2
+        if self.new_jsonb_schema :
+            assert len(t_schema)==0, 'Could not decide which middle db schema is used'
+        else :
+            assert len(t_schema)==2, 'Could not decide which middle db schema is used'
+
+        if self.debug :
+            print('s.tables=',self.tables,file=sys.stderr)
+        print('INFO:','detected middle database layout:','new jsonb' if self.new_jsonb_schema else 'legacy text[]',file=sys.stderr)
+        asyncio.run(self.test())
+        print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
+
+
+    def make_bounds_constr(self,table_key:str)->typing.Collection[str] :
+        ''' Lookup the table_key in self.tables and return the
+        "way && ST_MakeEnvelope(x1,y2,x2,y2)" part of a query for the specific
+        table table_key, and its fully qualified name.
+        Also account for SRID differences (osm data usually stored in 3857, latlon is 4326)
+        with ST_Transform().
+        '''
+        from_rel_id=False
+        tgt_srid=self.tables[table_key]['srid']
+        way_column=self.tables[table_key]['geom']
+        if self.bounds_geojson!=None :
+            with open(self.bounds_geojson,'r') as f :
+                geojson=f.read().strip()
+            way_constr=f"ST_GeomFromGeoJSON('{geojson}'::jsonb)"
+            way_constr_a=f'{way_column}&&ST_Transform({way_constr},{tgt_srid})'
+            #way_constr_b=f'ST_Intersects(way,ST_Transform({way_constr},3857))'
+        elif self.bounds_rel_id!=None :
+            osm_rel_id=self.bounds_rel_id
+            from_rel_id=True
+        elif self.bounds_iso!=None :
+            c_name,osm_rel_id=regions_lookup(self.bounds_iso)
+            l.log(f"Suggested output filename: '{c_name}.osm'")
+            osm_rel_id=int(osm_rel_id)
+            from_rel_id=True
+        elif self.bounds_box!=None :
+            lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
+            way_constr_a=f'{way_column}&&ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),{tgt_srid})'
+            #way_constr_b=f'ST_Intersects(way,ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857))'
+            #way_constr=f'way && ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857)'
+        else :
+            l.log('Error: no boundary provided.')
+            l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
+            exit(1)
+        if from_rel_id :
+            #relation ids are stored negative
+            relbound_way_col=self.tables['_polygon']['geom']
+            relbound_name=self.tables['_polygon']['name'] #stores negative osm_ids for relations
+            way_constr_a=f'{way_column}&&(SELECT relbound.{relbound_way_col} FROM {relbound_name} AS relbound WHERE osm_id={-osm_rel_id})'
+            #way_constr_b=f'ST_Intersects(way,(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id}))'
+        return way_constr_a,self.tables[table_key]['name']
+
+
+    async def test(self) :
+        ''' Test: checks if get_lonlat exsits, is executable.
+            And the get_lonlat execution will crash if planet.bin.nodes is
+            not readwrite or does not exist.
+        '''
+        result=[]
+        async for i in get_latlon_str_from_flatnodes(('2185493801','3546766428'),self) :
+            result.append(i)
+        return result
+
 
 class Logger() :
     def __init__(self) :
@@ -106,10 +220,9 @@ async def chain(*generators:typing.Iterator)->typing.Iterator:
                 yield i
 
 async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
-        args:argparse.Namespace)->typing.Iterator :
+        s:Settings)->typing.Iterator :
     #beware, need to exchange lonlat -> latlon
-    a=await asyncio.create_subprocess_exec(args.get_lonlat_binary,
-        args.nodes_file,
+    a=await asyncio.create_subprocess_exec(s.get_lonlat_binary,s.nodes_file,
         stdout=asyncio.subprocess.PIPE,stdin=asyncio.subprocess.PIPE)
     # some osm_ids may error out. in that case get_lonlat just ignores them.
     # therefore, take the output osm_id as source of truth.
@@ -126,59 +239,34 @@ async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
         x,y,osm_id=line.split(';')
         yield (osm_id,y,x)
 
-
-def all_nwr_within(c:psycopg2.extensions.cursor,accumulator:dict,args:argparse.Namespace) :
-    from_rel_id=False
-    if args.bounds_geojson!=None :
-        with open(args.bounds_geojson,'r') as f :
-            geojson=f.read().strip()
-        way_constr=f"ST_GeomFromGeoJSON('{geojson}'::jsonb)"
-        way_constr_a=f'way&&ST_Transform({way_constr},3857)'
-        way_constr_b=f'ST_Intersects(way,ST_Transform({way_constr},3857))'
-    elif args.bounds_rel_id!=None :
-        osm_rel_id=args.bounds_rel_id
-        from_rel_id=True
-    elif args.bounds_iso!=None :
-        c_name,osm_rel_id=regions_lookup(args.bounds_iso)
-        l.log(f"Suggested output filename: '{c_name}.osm'")
-        osm_rel_id=int(osm_rel_id)
-        from_rel_id=True
-    elif args.bounds_box!=None :
-        lon_from,lat_from,lon_to,lat_to=tuple(map(float,args.bounds_box.split(',')))
-        way_constr_a=f'way&&ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857)'
-        way_constr_b=f'ST_Intersects(way,ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857))'
-    else :
-        l.log('Error: no boundary provided.')
-        l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
-        exit(1)
-    if from_rel_id :
-        #relation ids are stored negative
-        way_constr_a=f'way&&(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
-        way_constr_b=f'ST_Intersects(way,(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id}))'
-        #way_constr=f'way && ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857)'
-# 1a) select all nodes WHERE way ST_Within(bbox);
+def all_nwr_within(s:Settings,accumulator:dict) :
+    # 1a) select all nodes WHERE way ST_Within(bbox);
     l.log('executing big query on planet_osm_point...',clearline=True)
-    c.execute(f'SELECT osm_id FROM planet_osm_point WHERE {way_constr_b};')
-    for row in g_from_cursor(c,verbose=True,prefix_msg='planet_osm_point ') :
+    constr,tbl_name=s.make_bounds_constr('_point')
+    s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
+    for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         accumulator['nodes'].add(row['osm_id'])
     l.log(len(accumulator['nodes']),'nodes within bounds')
 
     # 1b) select all ways,rels FROM planet_osm_polygon WHERE way ST_Within(bbox);
-    l.log('executing big query on planet_osm_polygon...',clearline=True)
-    c.execute(f'SELECT osm_id FROM planet_osm_polygon WHERE {way_constr_a};')
-    for row in g_from_cursor(c,verbose=True,prefix_msg='planet_osm_polygon ') :
+    constr,tbl_name=s.make_bounds_constr('_polygon')
+    l.log('executing big query on',tbl_name,'...',clearline=True)
+    s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
+    for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         id=row['osm_id']
         if id>0 :
             accumulator['ways'].add(id)
         else :
             accumulator['rels'].add(-id)
+    l.log(len(accumulator['ways']),'ways,',len(accumulator['rels']),'rels from',tbl_name)
+
     # 1c) select all ways,rels FROM planet_osm_line WHERE way ST_Within(bbox);
     # planet_osm_roads is not needed in that fashion, because it is a strict subset
     # of planet_osm_line, and we're only collecting ids of objects for now
-    l.log(len(accumulator['ways']),'ways,',len(accumulator['rels']),'rels from planet_osm_polygon')
-    l.log('executing big query on planet_osm_line...',clearline=True)
-    c.execute(f'SELECT osm_id FROM planet_osm_line WHERE {way_constr_b};')
-    for row in g_from_cursor(c,verbose=True,prefix_msg='planet_osm_line ') :
+    constr,tbl_name=s.make_bounds_constr('_line')
+    l.log('executing big query on',tbl_name,'...',clearline=True)
+    s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
+    for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         id=row['osm_id']
         if id>0 :
             accumulator['ways'].add(id)
@@ -190,7 +278,7 @@ def all_nwr_within(c:psycopg2.extensions.cursor,accumulator:dict,args:argparse.N
 def g_adaptive_parent_multiquery(c:psycopg2.extensions.cursor,ids:list,
         queries:typing.Collection[str],
         nodelist_lambda_tuples:typing.Collection[typing.Collection[typing.Callable]]
-        )->typing.Iterator :
+    )->typing.Iterator :
     ''' The database has some indexes on the bigint[] columns that contain
     arrays of children elements. We want to query those in reverse: which
     are all the parents of a given element ?
@@ -219,6 +307,8 @@ def g_adaptive_parent_multiquery(c:psycopg2.extensions.cursor,ids:list,
     chunks_unchanged_chunk_size=0
     stable=False
     chunks=0
+    # to trigger a QueryCanceled when the index could not be used and the query
+    # took too long
     c.execute("SET statement_timeout='1s';")
     printed_slow_warning=False
     while total_processed_nodes<len(ids) :
@@ -289,40 +379,17 @@ def g_adaptive_parent_multiquery(c:psycopg2.extensions.cursor,ids:list,
     c.execute("SET statement_timeout='2h';")
 
     
-def nodes_parent_wr(c:psycopg2.extensions.cursor,accumulator:dict) :
+def nodes_parent_wr(s:Settings,accumulator:dict) :
     # 2a) foreach node_id :
+    # 2b) select all ways WHERE ARRAY[node_id]::bigint[] <@ nodes;
+    # 2c) select all rels WHERE ARRAY[node_id]::bigint[] <@ parts;
     l.log('checking parent ways of',len(accumulator['nodes']),'nodes')
     way_count=0
     rel_count=0
     node_count=0
-    #for node_id_chunk in g_batches(accumulator['nodes'],11) :
-    #    # 2b) select all ways WHERE ARRAY[node_id]::bigint[] <@ nodes;
-    #    node_ids=','.join(map(str,node_id_chunk))
-    #    c.execute(f'SELECT id FROM planet_osm_ways WHERE ARRAY[{node_ids}]::bigint[] && nodes;')
-    #    node_count+=len(node_id_chunk)
-    #    for row in g_from_cursor(c) :
-    #        # SAVE ALL ways ids
-    #        way_count+=1
-    #        accumulator['ways'].add(row['id'])
-
-    #    # 2c) select all rels WHERE ARRAY[node_id]::bigint[] <@ parts;
-    #    #assert that the id in question is a node <=> n{id} exists in members (AND NOT w{id})
-    #    node_member_ids=','.join(map(lambda i:f"'n{i}'",node_id_chunk))
-    #    c.execute(f'''SELECT id FROM
-    #        (SELECT id,members FROM planet_osm_rels
-    #            WHERE ARRAY[{node_ids}]::bigint[] && parts) AS parts_indexed
-    #        WHERE ARRAY[{node_member_ids}] && members;''')
-    #    for row in g_from_cursor(c) :
-    #        # SAVE ALL rel ids
-    #        accumulator['rels'].add(row['id'])
-    #        rel_count+=1
-    #    print(end='\r\033[2K')
-    #    print(way_count,'ways,',rel_count,
-    #        'rels parents of node',node_count,'/',
-    #        len(accumulator['nodes']),end='\r')
 
     try :
-        c.execute('SELECT planet_osm_index_bucket(ARRAY[]::bigint[])')
+        s.c.execute('SELECT planet_osm_index_bucket(ARRAY[]::bigint[])')
         use_bucket_func=True
     except psycopg2.errors.UndefinedFunction :
         use_bucket_func=False #does not exist
@@ -331,19 +398,23 @@ def nodes_parent_wr(c:psycopg2.extensions.cursor,accumulator:dict) :
     else :
         add_buck=''
 
-    if new_jsonb_schema :
-        # the ::cahr(1) cast IS IMPORTANT for index performance, 10x or more slower without it
-        rels_query="SELECT id FROM planet_osm_rels WHERE planet_osm_member_ids(members,'N'::char(1)) && ARRAY[{0}]::bigint[];"
+    tbl_rels=s.tables['_rels']['name']
+    tbl_ways=s.tables['_ways']['name']
+    if s.new_jsonb_schema :
+        # the ::char(1) cast IS IMPORTANT for index performance, 10x or more slower without it
+        rels_query="SELECT id FROM "+tbl_rels
+        rels_query+=" WHERE planet_osm_member_ids(members,'N'::char(1)) && ARRAY[{0}]::bigint[];"
         rels_lambdas=(lambda i:','.join(map(str,i)),)
     else :
-        parts_indexed="SELECT id,members FROM planet_osm_rels WHERE ARRAY[{0}]::bigint[] && parts"
+        parts_indexed="SELECT id,members FROM "+tbl_rels
+        parts_indexed+=" WHERE ARRAY[{0}]::bigint[] && parts"
         members_where="ARRAY[{1}] && members"
         rels_query=f'SELECT id FROM ({parts_indexed}) AS parts_indexed WHERE {members_where};'
         rels_lambdas=(lambda i:','.join(map(str,i)),lambda i:','.join(map(lambda j:f"'n{j}'",i)),)
     
-    for node_c,way_ids,rel_ids in g_adaptive_parent_multiquery(c,
+    for node_c,way_ids,rel_ids in g_adaptive_parent_multiquery(s.c,
             list(accumulator['nodes']),
-            ('SELECT id FROM planet_osm_ways WHERE '+add_buck+'ARRAY[{0}]::bigint[] && nodes;',
+            ('SELECT id FROM '+tbl_ways+' WHERE '+add_buck+'ARRAY[{0}]::bigint[] && nodes;',
                 rels_query),
             [(lambda i:','.join(map(str,i)),),rels_lambdas]) :
         node_count+=node_c
@@ -360,26 +431,26 @@ def nodes_parent_wr(c:psycopg2.extensions.cursor,accumulator:dict) :
     l.log(len(accumulator['ways']),'ways forward from nodes')
     l.log(len(accumulator['rels']),'rels forward from nodes')
 
-def ways_parent_r(c:psycopg2.extensions.cursor,accumulator:dict) :
+def ways_parent_r(s:Settings,accumulator:dict) :
     # 3a) foreach way_id :
-    #for way_id in accumulator['ways'] :
-    #    # 3b) select all rels WHERE ARRAY[way_id]::bigint[] <@ parts;
-    #    #assert that the id in question is a way <=> w{id} exists in members (AND NOT n{id})
-    #    c.execute(f'''SELECT id FROM
-    #        (SELECT id,members FROM planet_osm_rels
-    #            WHERE ARRAY[{way_id}]::bigint[]<@parts) AS parts_indexed
-    #        WHERE ARRAY['w{way_id}']<@members;''')
-    #    for row in g_from_cursor(c) :
-    #        # SAVE ALL rel ids
-    #        accumulator['rels'].add(row['id'])
+    # 3b) select all rels WHERE ARRAY[way_id]::bigint[] <@ parts;
     way_count=0
     rel_count=0
-    for way_c,rel_ids in g_adaptive_parent_multiquery(c,list(accumulator['ways']),
-            ('''SELECT id FROM
-            (SELECT id,members FROM planet_osm_rels
-                WHERE ARRAY[{0}]::bigint[] && parts) AS parts_indexed
-            WHERE ARRAY[{1}] && members;''',),[(lambda i:','.join(map(str,i)),
-            lambda i:','.join(map(lambda j:f"'w{j}'",i)),)]) :
+    tbl_rels=s.tables['_rels']['name']
+    if s.new_jsonb_schema :
+        # the ::char(1) cast IS IMPORTANT for index performance, 10x or more slower without it
+        rels_query="SELECT id FROM "+tbl_rels
+        rels_query+=" WHERE planet_osm_member_ids(members,'W'::char(1)) && ARRAY[{0}]::bigint[];"
+        rels_lambdas=(lambda i:','.join(map(str,i)),)
+    else :
+        parts_indexed="SELECT id,members FROM "+tbl_rels
+        parts_indexed+=" WHERE ARRAY[{0}]::bigint[] && parts"
+        members_where="ARRAY[{1}] && members"
+        rels_query=f'SELECT id FROM ({parts_indexed}) AS parts_indexed WHERE {members_where};'
+        rels_lambdas=(lambda i:','.join(map(str,i)),lambda i:','.join(map(lambda j:f"'w{j}'",i)),)
+
+    for way_c,rel_ids in g_adaptive_parent_multiquery(s.c,list(accumulator['ways']),
+            (rels_query,),[rels_lambdas]) :
         way_count+=way_c
         for rel in rel_ids:
             rel_count+=1
@@ -389,7 +460,13 @@ def ways_parent_r(c:psycopg2.extensions.cursor,accumulator:dict) :
                 '    ',percent(way_count,len(accumulator['ways'])),clearline=True)
     l.log(len(accumulator['rels']),'rels forward')
 
-def rels_children_nwr(c:psycopg2.extensions.cursor,accumulator:dict,only_multipolygon_rels=False,without_rels=False) :
+def rels_children_nwr(s:Settings,accumulator:dict,only_multipolygon_rels=False,without_rels=False) :
+    ''' Going over all rel ids in accumulator, read every rel's members[] array and add all its
+    children, according to their type: node/way/relation, to the accumulator.
+    without_rels==True means to disregard the rel's children that are rels.
+    only_multipolygon_rels==True means to only add the children of rels that
+    are type="multipolygon".
+    '''
     # 4) BACKpropagation: resolve to take in all rels->ways->nodes
     # 4a) foreach rel_id: add all its members'ids as n{id} -> node, w{id} -> way, or r{id} -> rel
     node_count=0
@@ -400,21 +477,22 @@ def rels_children_nwr(c:psycopg2.extensions.cursor,accumulator:dict,only_multipo
     # with an associated geometry. constrast that to a type="route" or type="superroute",
     # thore are only groups of already representable ways on the map
     # see osm wiki /Types_of_relation for more
-    if new_jsonb_schema :
+    if s.new_jsonb_schema :
         multipolygon_constr=" AND (tags->>'type')='multipolygon'"
     else :
         multipolygon_constr=" AND ((tags::hstore)->'type')='multipolygon'"
     multipolygon_constr=multipolygon_constr if only_multipolygon_rels else ''
 
+    tbl_rels=s.tables['_rels']['name']
     for j in (1,2): #repeat twice to resolve rels that have rels as children
         buffer_add_rels=set()
         for rel_id in accumulator['rels'] :
             #for row in g_query_ids()
             tot_count+=1
-            c.execute(f'SELECT members FROM planet_osm_rels WHERE id={rel_id}{multipolygon_constr};')
-            for row in g_from_cursor(c) :
+            s.c.execute(f'SELECT members FROM {tbl_rels} WHERE id={rel_id}{multipolygon_constr};')
+            for row in g_from_cursor(s.c) :
                 ms=row['members']
-                if new_jsonb_schema :
+                if s.new_jsonb_schema :
                     for m in ms :
                         if m['type']=='N' :
                             accumulator['nodes'].add(m['ref'])
@@ -476,14 +554,15 @@ def ways_children_n(c:psycopg2.extensions.cursor,accumulator:dict) :
     l.log('collected',node_count,'nodes,','children of',len(accumulator['ways']),'ways')
 
 
-async def stream_osm_xml(c:psycopg2.extensions.cursor,args:argparse.Namespace) :
+async def stream_osm_xml(s:Settings) :
     ''' Query osm2pgsql-imported postgres database for nodes, ways and rels and stream
-    an xml representation of them into args.out_file. Attempts to select objects that are in
+    an xml representation of them into s.out_file. Attempts to select objects that are in
     the given bounds. But the dependencies are sometimes required, so more data that just
     within the bounds will be included. Currently, no geometric features are clipped in
     any way.
-    See --help for args.bounds.
+    See --help for s.bounds.
     '''
+    ## TODO: move this config to Settings
     with_parents=False
     phases=['within','parents','children','write']
     if not with_parents :
@@ -492,16 +571,17 @@ async def stream_osm_xml(c:psycopg2.extensions.cursor,args:argparse.Namespace) :
     #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
     accumulator={'nodes':set(),'ways':set(),'rels':set()}
 
-    all_nwr_within(c,accumulator,args)
+    all_nwr_within(s,accumulator)
     if with_parents :
         l.next_phase() #parents
-        nodes_parent_wr(c,accumulator)
-        #ways_parent_r(c,accumulator)
+        nodes_parent_wr(s,accumulator)
+        ways_parent_r(s,accumulator)
 
     l.next_phase() #children
     # do we want big forests ? yes even outside the bounds
-    rels_children_nwr(c,accumulator,only_multipolygon_rels=True,without_rels=True)
-    ways_children_n(c,accumulator)
+    ## TODO: move config to Settings
+    rels_children_nwr(s,accumulator,only_multipolygon_rels=True,without_rels=True)
+    ways_children_n(s.c,accumulator)
 
     counts=[len(accumulator[i])for i in ('nodes','ways','rels')]
     l.log('dumping',counts[0],'nodes,',counts[1],'ways,',counts[2],'rels in total')
@@ -510,21 +590,21 @@ async def stream_osm_xml(c:psycopg2.extensions.cursor,args:argparse.Namespace) :
     # RAM-inefficient otherwise; more RAM-inefficient for bigger extracts.
     # do more of a streaming from database to file approach
     l.next_phase() #write
-    out_file=sys.stdout.buffer if args.out_file=='-' else args.out_file
-    with lxml.etree.xmlfile(out_file,encoding='utf-8') as xml_out :
+    out_file=sys.stdout.buffer if s.out_file=='-' else s.out_file
+    with ET.xmlfile(out_file,encoding='utf-8') as xml_out :
         xml_out.write_declaration()
         with xml_out.element('osm',{
                 'version':'0.6',
                 'generator':time.strftime('https://github.com/feludwig/pgsql2osm/pgsql2osm.py %F')
         }) :
             async for el in chain(
-                    create_nodes(c,list(accumulator['nodes']),args),
-                    create_ways(c,list(accumulator['ways'])),
-                    create_relations(c,list(accumulator['rels'])),
+                    create_nodes(s,list(accumulator['nodes'])),
+                    create_ways(s,list(accumulator['ways'])),
+                    create_relations(s,list(accumulator['rels'])),
             ) :
                 xml_out.write(el)
 
-def rel_to_xml(row_dict:dict)->ET.Element :
+def rel_to_xml(row_dict:dict,new_jsonb_schema:bool)->ET.Element :
     rel=ET.Element('relation',{'id':str(row_dict['id'])})
     #collapse hstore tags
     try :
@@ -558,42 +638,35 @@ def rel_to_xml(row_dict:dict)->ET.Element :
             ET.SubElement(rel,'tag',{'k':str(k),'v':str(v)})
     return rel
 
-def create_relations(c:psycopg2.extensions.cursor,ids:list)->typing.Iterator[ET.Element] :
-    table_name='planet_osm_polygon'
+def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
+    tbl_rels=s.tables['_rels']['name']
+    table_name=s.tables['_polygon']['name']
     l.log(0,'/',len(ids),'rels, reading table',table_name,'...',clearline=True)
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         # we need to merge the _polygon tags with the _rels tags.
         # _planet tags are overwritten by _rels tags because
         # json_tags is first loaded, the json_tags2 overloads all existing and non-existing keys
-        'planet_osm_rels.tags AS json_tags2' if new_jsonb_schema else 'hstore_to_json(planet_osm_rels.tags::hstore) AS json_tags2',
+        f'{tbl_rels}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2',
         # do we need this ? no ; especially the tags->'area'='yes' will overwrite 'area' if it exists
         #f'{table_name}.way_area AS area',
         #I think real does not exist and real->float4
-        *list(get_columns_of_types(c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))
-    query+=f',planet_osm_rels.members FROM {table_name} JOIN planet_osm_rels'
+    query+=f',{tbl_rels}.members FROM {table_name} JOIN {tbl_rels}'
     query+=f' ON -{table_name}.osm_id=planet_osm_rels.id'
 
     # the JOIN makes this query incredibly slow...
-    #query+=f' FROM {table_name} '
+    # BUT ONLY "ON osm_id=-id", and "ON -osm_id=id" is fast...
 
     done_ids=set()
     # psql does not have an index on -osm_id and does not understand *=-1 is bijective.
     #therevore  checking -osm_id IN (id1,id2,id3) is super slow, but
     # osm_id IN (-id1,-id2,-id3) is fast. But it needs some more memory in python to
     # store the negatives copy as well
-    #for row_dict in g_query_ids(c,query,list(-i for i in ids),'osm_id',verbose=True,step=2) :
-    for row_dict in g_query_ids(c,query,list(-i for i in ids),'osm_id',step=250) :
-        #other_cursor.execute(f'SELECT members,hstore_to_json(tags::hstore) AS json_tags FROM planet_osm_rels WHERE id={row_dict["id"]}')
-        ##l.log('querying',row_dict['id'])
-        #columns=[i.name for i in other_cursor.description]
-        #other_row=other_cursor.fetchone()
-        #other_row_dict={k:v for k,v in zip(columns,other_row) if v!=None}
-        #row_dict['members']=other_row_dict['members']
-        #row_dict['json_tags2']=other_row_dict['json_tags']
-        yield rel_to_xml(row_dict)
+    for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
+        yield rel_to_xml(row_dict,s.new_jsonb_schema)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
     missing_ids=set()
@@ -601,18 +674,21 @@ def create_relations(c:psycopg2.extensions.cursor,ids:list)->typing.Iterator[ET.
         if i not in done_ids :
             missing_ids.add(i)
 
-    table_name='planet_osm_rels'
+    #TODO: I forgot about planet_osm_line...
+
+
+    table_name=tbl_rels
     l.log(len(done_ids),'/',len(ids),prependline=True)
     l.log('rels: still',len(missing_ids),'missing, reading table',table_name)
     #in this table, tags is ::text[], not a hstore
-    if new_jsonb_schema :
+    if s.new_jsonb_schema :
         query=f'SELECT id,members,tags AS json_tags FROM {table_name}'
     else :
         query=f'SELECT id,members,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
     count=len(done_ids)+0
-    #bigger step than previous, because there is (heurisitcally) less data for these "light" relations
-    for row_dict in g_query_ids(c,query,list(missing_ids),'id',step=300) :
-        yield rel_to_xml(row_dict)
+    #bigger step than previous, because there is (heurisitcally) less data for these "tagless" relations
+    for row_dict in g_query_ids(s.c,query,list(missing_ids),'id',step=300) :
+        yield rel_to_xml(row_dict,s.new_jsonb_schema)
         count+=1
         l.log(count,'/',len(ids),'rels','    ',percent(count,len(ids)),clearline=True)
 
@@ -636,23 +712,24 @@ def way_to_xml(row_dict:dict)->ET.Element :
             ET.SubElement(way,'tag',{'k':str(k),'v':str(v)})
     return way
 
-def create_ways(c:psycopg2.extensions.cursor,ids:list)->typing.Iterator[ET.Element] :
-    table_name='planet_osm_polygon'
+def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
+    tbl_ways=s.tables['_ways']['name']
+    table_name=s.tables['_polygon']['name']
     l.log(0,'/',len(ids),'ways, reading table',table_name,'...',clearline=True)
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags', #polygons stores a hstore even in the new_jsonb_schema
-        'planet_osm_ways.tags AS json_tags2' if new_jsonb_schema else f'hstore_to_json(planet_osm_ways.tags::hstore) AS json_tags2',
+        f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
         # do we need this ? no
         #f'{table_name}.way_area AS area',
         #I think real does not exist and real->float4
-        *list(get_columns_of_types(c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))
-    query+=f',planet_osm_ways.nodes FROM {table_name} JOIN planet_osm_ways'
-    query+=f' ON {table_name}.osm_id=planet_osm_ways.id'
+    query+=f',planet_osm_ways.nodes FROM {table_name} JOIN {tbl_ways}'
+    query+=f' ON {table_name}.osm_id={tbl_ways}.id'
 
     done_ids=set()
-    for row_dict in g_query_ids(c,query,ids,'osm_id') :
+    for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
         yield way_to_xml(row_dict)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'ways','    ',percent(len(done_ids),len(ids)),clearline=True)
@@ -661,16 +738,18 @@ def create_ways(c:psycopg2.extensions.cursor,ids:list)->typing.Iterator[ET.Eleme
         if i not in done_ids :
             missing_ids.add(i)
 
-    table_name='planet_osm_ways'
+    #TODO: forgot about planet_osm_line
+
+    table_name=tbl_ways
     l.log(len(done_ids),'/',len(ids),prependline=True)
     l.log('ways: still',len(missing_ids),'missing, reading table',table_name)
     #in this table, tags::text[], not yet a hstore
-    if new_jsonb_schema :
+    if s.new_jsonb_schema :
         query=f'SELECT id,nodes,tags AS json_tags FROM {table_name}'
     else :
         query=f'SELECT id,nodes,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
     count=len(done_ids)+0
-    for row_dict in g_query_ids(c,query,list(missing_ids),'id') :
+    for row_dict in g_query_ids(s.c,query,list(missing_ids),'id') :
         yield way_to_xml(row_dict)
         count+=1
         l.log(count,'/',len(ids),'ways','    ',percent(count,len(ids)),clearline=True)
@@ -725,19 +804,18 @@ def get_columns_of_types(c:psycopg2.extensions.cursor,
     for colname,strtype in c.fetchall() :
         yield table_name+'.'+('"'+colname+'"' if colname.find(':')>0 else colname)
 
-async def create_nodes(c:psycopg2.extensions.cursor,ids:list,
-        args:argparse.Namespace)->typing.Iterator[ET.Element] :
-    table_name='planet_osm_point'
+async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
+    table_name=s.tables['_point']['name']
     l.log(0,'/',len(ids),'nodes, reading table',table_name,'...',clearline=True)
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         f'ST_X(ST_Transform({table_name}.way,4326)) AS lon',
         f'ST_Y(ST_Transform({table_name}.way,4326)) AS lat',
-        *list(get_columns_of_types(c,('int4','int','int8','int16','text'),table_name))
+        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))+f' FROM {table_name}'
     done_nodes=set()
-    for row_dict in g_query_ids(c,query,ids,'osm_id') :
+    for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
         row_attrs={k:str(row_dict[k]) for k in ('id','lat','lon')}
         # expand the json_tags to the tags and remove 'json_tags'
         try :
@@ -762,7 +840,7 @@ async def create_nodes(c:psycopg2.extensions.cursor,ids:list,
     #            yield node_id
     count=len(done_nodes)+0
     for batch in g_batches((i for i in ids if i not in done_nodes),5_000) :
-        async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch,args) :
+        async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch,s) :
             yield ET.Element('node',{'id':str(osm_id),'lat':lat,'lon':lon})
             count+=1
             if count%16==0 :
@@ -783,15 +861,6 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
     if len(current_batch)!=0 :
         yield current_batch
 
-async def test(args:argparse.Namespace) :
-    ''' Test: checks if get_lonlat exsits, is executable.
-        And the get_lonlat execution will crash if planet.bin.nodes is
-        not readwrite or does not exist.
-    '''
-    result=[]
-    async for i in get_latlon_str_from_flatnodes(('2185493801','3546766428'),args) :
-        result.append(i)
-    return result
 
 l=Logger() #global variable
 
@@ -803,50 +872,31 @@ if __name__=='__main__' :
         help="Path to the get_lonlat binary")
     parser.add_argument('nodes_file',
         help='Path to the nodes file created by osm2pgsql at import')
-    parser.add_argument('-d','--dsn',
-        dest='postgres_dsn',
-        help="The connection string to pass to psycopg2 eg 'host=localhost dbname=gis' port=5432",
-        default='dbname=gis')
+    parser.add_argument('-d','--dsn',dest='postgres_dsn',
+        default='dbname=gis',
+        help="The connection string to pass to psycopg2 eg 'host=localhost dbname=gis port=5432'")
+
     #one of the following:
-    parser.add_argument('-b','--bbox',
-        dest='bounds_box',
-        default=None,
-        type=str,
+    parser.add_argument('-b','--bbox',dest='bounds_box',
+        default=None,type=str,
         help='Rectangle boundary in the format lon_from,lat_from,lon_to,lat_to')
-    parser.add_argument('-r','--osm-rel-id',
-        dest='bounds_rel_id',
-        default=None,
-        help='Integer for the osm relation that should make the boundary',
-        type=int)
-    parser.add_argument('-i','--iso',
-        dest='bounds_iso',
+    parser.add_argument('-r','--osm-rel-id',dest='bounds_rel_id',
+        default=None,type=int,
+        help='Integer for the osm relation that should make the boundary')
+    parser.add_argument('-i','--iso',dest='bounds_iso',
         default=None,
         help='Country or region code for looking up in regions.csv, to determine boundary')
-    parser.add_argument('-g','--geojson',
-        dest='bounds_geojson',
+    parser.add_argument('-g','--geojson',dest='bounds_geojson',
         default=None,
         help='Geojson file for determining the boundary')
 
-    parser.add_argument('-o','--output',
-        dest='out_file',
+    parser.add_argument('-o','--output',dest='out_file',
         help="Path where the output .osm should be written to. When '-', write to stdout",
         required=True)
 
+    parser.add_argument('--debug',dest='debug',default=False,
+        help='Show additional debugging information')
+
 
     args=parser.parse_args()
-    access=psycopg2.connect(args.postgres_dsn)
-    other_cursor=access.cursor()
-    j_schema=list(get_columns_of_types(other_cursor,('jsonb',),'planet_osm_rels'))
-    t_schema=list(get_columns_of_types(other_cursor,('_text',),'planet_osm_rels'))
-    new_jsonb_schema=len(j_schema)==2
-    if new_jsonb_schema :
-        assert len(t_schema)==0, 'Could not decide which middle db schema is used'
-    else :
-        assert len(t_schema)==2, 'Could not decide which middle db schema is used'
-
-    print('INFO:','detected middle database layout:','new jsonb' if new_jsonb_schema else 'legacy text[]',file=sys.stderr)
-
-    asyncio.run(test(args))
-
-    print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
-    t=asyncio.run(stream_osm_xml(access.cursor(),args))
+    t=asyncio.run(stream_osm_xml(Settings(args)))
