@@ -687,16 +687,36 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         #f'{tbl_rels}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2',
         *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
+    
+    start_t=time.time()
+    l.log('rels _line output start',start_t)
+    #TEMP: there seems to be no index on _line! so we do additional queries one by one when double_query_mode==True
+    double_query_mode=True
+    if not double_query_mode :
+        read_columns.append(f'{tbl_rels}.members')
+        if s.new_jsonb_schema :
+            read_columns.append(f'{tbl_rels}.tags AS json_tags2')
+        else :
+            read_columns.append(f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2')
     query='SELECT '+(','.join(read_columns))+f' FROM {table_name}'
-    #TEMP: there seems to be no index on _line! so we do queries one by one
-    if s.new_jsonb_schema :
-        query2=f'SELECT tags AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
-    else :
-        query2=f'SELECT hstore_to_json(tags::hstore) AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
-    cursor2=s.access.cursor() # need a second cursor here
 
-    # the JOIN makes this query incredibly slow...
-    # BUT ONLY "ON osm_id=-id", and "ON -osm_id=id" is fast...
+    if not double_query_mode :
+        # try an approach with ids substituted twice in, once positive and once negative
+        # would g_adaptive_parent_multiquery work here ? it's not for parents though...
+        # sloooow
+        #query+=f' JOIN {tbl_rels} ON {table_name}.osm_id=-{tbl_rels}.id'
+        #query+=f' JOIN {tbl_rels} ON -{table_name}.osm_id={tbl_rels}.id'
+        # sloow
+        query+=f', {tbl_rels} WHERE {table_name}.osm_id=-{tbl_rels}.id'
+        #slooow
+        #query+=f', {tbl_rels} WHERE -{table_name}.osm_id={tbl_rels}.id'
+    else :
+        # try a FROM _line,_rels WHERE -_line.osm_id=rels.id, maybe that recognizes the index ?
+        if s.new_jsonb_schema :
+            query2=f'SELECT tags AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
+        else :
+            query2=f'SELECT hstore_to_json(tags::hstore) AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
+        cursor2=s.access.cursor() # need a second cursor here
 
     done_ids=set()
     # psql does not have an index on -osm_id and does not understand *=-1 is bijective.
@@ -706,12 +726,14 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
         if row_dict['id'] in done_ids :
             continue
-        cursor2.execute(query2+str(row_dict['id']))
-        #add this missing data, ORDER important
-        row_dict['json_tags2'],row_dict['members']=cursor2.fetchone()
+        if double_query_mode :
+            cursor2.execute(query2+str(row_dict['id']))
+            #add this missing data, ORDER important
+            row_dict['json_tags2'],row_dict['members']=cursor2.fetchone()
         yield rel_to_xml(row_dict,s.new_jsonb_schema)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
+    l.log('rels _line output end',(time.time()-start_t))
 
     missing_ids=set()
     for i in ids :
@@ -835,15 +857,20 @@ def g_query_ids(c:psycopg2.extensions.cursor,query:str,
         ids:list,id_col:str,step=1000,verbose=False)->typing.Iterator[dict] :
     ''' Given an SQL query without the ending semicolon and where the last
     clause is a WHERE, append AND {id_col} IN (*ids) and yield those results.
+    The parenthesizing should be made explicit, NO GUARANTEER in this case:
+    [...] WHERE condA OR condB -> [...] WHERE condA OR condB AND id IN ([...])
+    -> SHOULD write [...] WHERE (condA OR condB)
     A psql syntax error will be thrown if ORDER BY, LIMIT are the last clause.
     '''
     l_ids=len(ids)
     init_query=query
     # case of 'SELECT ... FROM table' -> 'SELECT .. FROM table WHERE {append_query}'
+    with_and='AND'
     if init_query.find('WHERE')<0 :
         init_query+=' WHERE'
+        with_and='' #remove the AND
     for i in range(0,l_ids,step) :
-        query=f'{init_query} {id_col} IN ('
+        query=f'{init_query} {with_and} {id_col} IN ('
         query+=','.join(map(str,ids[i:i+step]))
         query+=');'
         if verbose :
@@ -964,4 +991,5 @@ if __name__=='__main__' :
 
 
     args=parser.parse_args()
-    t=asyncio.run(stream_osm_xml(Settings(args)))
+    s=Settings(args)
+    t=asyncio.run(stream_osm_xml(s))
