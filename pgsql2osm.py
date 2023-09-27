@@ -94,6 +94,7 @@ class Settings :
         print('INFO:','detected middle database layout:','new jsonb' if self.new_jsonb_schema else 'legacy text[]',file=sys.stderr)
         asyncio.run(self.test())
         print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
+        self.has_suggested_out_filename=False #only print suggestion once
 
 
     def make_bounds_constr(self,table_key:str)->typing.Collection[str] :
@@ -117,7 +118,9 @@ class Settings :
             from_rel_id=True
         elif self.bounds_iso!=None :
             c_name,osm_rel_id=regions_lookup(self.bounds_iso)
-            l.log(f"Suggested output filename: '{c_name}.osm'")
+            if not self.has_suggested_out_filename :
+                self.has_suggested_out_filename=True
+                l.log(f"Suggested output filename: '{c_name}.osm'")
             osm_rel_id=int(osm_rel_id)
             from_rel_id=True
         elif self.bounds_box!=None :
@@ -681,12 +684,16 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
 
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
-        f'{tbl_rels}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2',
+        #f'{tbl_rels}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2',
         *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
-    query='SELECT '+(','.join(read_columns))
-    query+=f',{tbl_rels}.members FROM {table_name} JOIN {tbl_rels}'
-    query+=f' ON -{table_name}.osm_id={tbl_rels}.id'
+    query='SELECT '+(','.join(read_columns))+f' FROM {table_name}'
+    #TEMP: there seems to be no index on _line! so we do queries one by one
+    if s.new_jsonb_schema :
+        query2=f'SELECT tags AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
+    else :
+        query2=f'SELECT hstore_to_json(tags::hstore) AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
+    cursor2=s.access.cursor() # need a second cursor here
 
     # the JOIN makes this query incredibly slow...
     # BUT ONLY "ON osm_id=-id", and "ON -osm_id=id" is fast...
@@ -699,6 +706,9 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
         if row_dict['id'] in done_ids :
             continue
+        cursor2.execute(query2+str(row_dict['id']))
+        #add this missing data, ORDER important
+        row_dict['json_tags2'],row_dict['members']=cursor2.fetchone()
         yield rel_to_xml(row_dict,s.new_jsonb_schema)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
@@ -716,7 +726,8 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         #in this table, tags is ::text[], not a hstore
         query=f'SELECT id,members,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
     count=len(done_ids)+0
-    #bigger step than previous, because there is (heurisitcally) less data for these "tagless" relations
+    #bigger step than previous, because there is (heurisitcally) less data for these "light" relations,
+    # which have no interesting tags regarding rendering making them worthy of a place in _polygon or _line
     for row_dict in g_query_ids(s.c,query,list(missing_ids),'id',step=300) :
         yield rel_to_xml(row_dict,s.new_jsonb_schema)
         count+=1
@@ -816,6 +827,9 @@ def g_from_cursor(c:psycopg2.extensions.cursor,verbose=False,prefix_msg='')->typ
             l.log(prefix_msg+'row',count,'/',tot_count,'    ',percent(count,tot_count),clearline=True)
         yield {k:v for k,v in zip(columns,row) if v!=None}
         count+=1
+    if verbose:
+        count-=1
+        l.log(prefix_msg+'row',count,'/',tot_count,'    ',percent(count,tot_count),clearline=True)
 
 def g_query_ids(c:psycopg2.extensions.cursor,query:str,
         ids:list,id_col:str,step=1000,verbose=False)->typing.Iterator[dict] :
@@ -888,10 +902,7 @@ async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
                 percent(len(done_nodes),len(ids)),clearline=True)
     l.log('now querying flatnodes file for missing nodes')
     to_get_lat_lons=set()
-    #def g_in() :
-    #    for node_id in ids :
-    #        if node_id not in done_nodes :
-    #            yield node_id
+
     count=len(done_nodes)+0
     for batch in g_batches((i for i in ids if i not in done_nodes),5_000) :
         async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch,s) :
@@ -899,7 +910,6 @@ async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
             count+=1
             if count%16==0 :
                 l.log(count,'/',len(ids),'nodes','    ',percent(count,len(ids)),clearline=True)
-    print(file=sys.stderr)
 
 def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Collection] :
     ''' Return sets of items yielded by generator of length at
