@@ -156,12 +156,14 @@ and are the biggest with that suffix in the database, by used space
     * `parts::bigint[]` any ids of (mixed) nodes,
 ways or relations that are children of that relation,
     * `tags::text[]` for the relation's tags in hstore format,
-    * `members::text[]` that more precisely describes the children, example `{'n123','admin_centre','w345','outer','w567','inner'}`
-having the node `123` as a role `admin_centre` and the ways `345` and `567` as `outer` and `inner` boundaries
+    * `members::text[]` that more precisely describes the children,
+example `{'n123','admin_centre','w345','outer','w567','inner'}`
+having the node `123` as a role `admin_centre` and the ways `345` and `567`,
+as roles `outer` and `inner` boundaries respectively
   - in the case of new jsonb format:
     * `members::jsonb` a list of json objects describing the members, the example continued
 `[{"ref":"123","role":"admin_centre","type":"N"},{"ref":"345","role":"outer","type":"W"},
-{"ref":"567","role":"inner","type":"W"}`,
+{"ref":"567","role":"inner","type":"W"}]`,
     * and `tags::jsonb` for the relation's tags in `{"key1":"value1","key2":"value2"}` format,
 
 * Access needed: `SELECT` granted on the above mentioned tables and also
