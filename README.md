@@ -90,9 +90,9 @@ hundreds of kilometers beyond the boundary if that is a continuous entity
 
 ### Unsorted ids
 
-The output ids are streamed in the order they come from the database, and for spped reasons
+The output ids are streamed in the order they come from the database, and for speed reasons
 this is unsorted. If you need a sorted `.osm`, use
-[osmium](https://osmcode.org/osmium-tool/) :
+[`osmium`](https://osmcode.org/osmium-tool/) after exporting:
 
 
 `osmium sort in.osm.bz2  --output=out.osm.bz2`
@@ -115,7 +115,7 @@ it to `.osm` and then converting it back to `.osm.pbf` will produce a **differen
 
 The data from the database is straightforwardly reinterpreted to mean key=value
 osm tags. This is not strictly the case, for example the cycleway and bicycle
-tags. Currently no back-transformations, to compensate for lua transforms,
+tags. Currently no back-transformations, to compensate for import-time lua transforms,
 are performed on the data.
 
 Installation
@@ -183,7 +183,7 @@ To generate `regions.csv`, run in a planet database:
 
 
 _Note_ : only `admin_level`<=4 is loaded into `regions.csv`.
-Use a search on [openstreetmap.org](openstreetmap.org) for smaller regions.
+Use a search on [openstreetmap.org](https://www.openstreetmap.org) for smaller regions.
 And then extract the relation id from the url:
 [https://www.openstreetmap.org/relation/\<N\>](https://www.openstreetmap.org/relation/51701)
 eg Switzerland
