@@ -557,6 +557,9 @@ def ways_children_n(s:Settings,accumulator:dict) :
         if way_count%32==0 :
             l.log(node_count,'nodes children of way',way_count,'/',len(accumulator['ways']),
                 '    ',percent(way_count,len(accumulator['ways'])),clearline=True)
+    #end write line with 100%
+    l.log(node_count,'nodes children of way',way_count,'/',len(accumulator['ways']),
+        '    ',percent(way_count,len(accumulator['ways'])),clearline=True)
     l.log('collected',node_count,'nodes,','children of',len(accumulator['ways']),'ways')
 
 
@@ -921,7 +924,11 @@ async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     query='SELECT '+(','.join(read_columns))+f' FROM {table_name}'
     done_nodes=set()
     for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
-        row_attrs={k:str(row_dict[k]) for k in ('id','lat','lon')}
+        # in str, a number with 9999 end digits will waste space.
+        # change all lat/lons :7.543702599999998->7.5437026.
+        # 10 digit degrees is +- 0.011mm precision
+        row_attrs={k:str(round(row_dict[k],10)) for k in ('lat','lon')}
+        row_attrs['id']=str(row_dict['id'])
         # expand the json_tags to the tags and remove 'json_tags'
         try :
             for k,v in row_dict.pop('json_tags').items() :
