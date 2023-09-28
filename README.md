@@ -75,7 +75,9 @@ available in databases created by `osm2pgsql`>=1.9)
 ### Benchmarks 
 
 * `Switzerland.osm.bz2` is `694MB` in `real 1h08min/user 32mim/sys 22min`
-* `Germany-Bavaria.osm.bz2` is `2.2GB`, in `real 6h49min/user 1h36min/sys 2h49min`.
+for `46.7M nodes, 5.46M ways, 80K rels`.
+* `Germany-Bavaria.osm.bz2` is `2.2GB`, in `real 6h49min/user 1h36min/sys 2h49min`
+for `136M nodes, 19.2M ways, 164K rels`.
 
 Disclaimer
 ---
