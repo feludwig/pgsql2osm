@@ -539,6 +539,7 @@ def rels_children_nwr(s:Settings,accumulator:dict,only_multipolygon_rels=False,w
             return #after first run
         for rel_id in buffer_add_rels :
             accumulator['rels'].add(rel_id)
+        tot_count=0 #reset counter to make only count up to 100% not 200%
     l.log('collected',node_count,'nodes,',way_count,'ways,',rel_count,'rels',
         'children of',len(accumulator['rels']),'rels')
 
@@ -610,13 +611,18 @@ async def stream_osm_xml(s:Settings) :
                 xml_out.write(el)
 
 def rel_to_xml(row_dict:dict,new_jsonb_schema:bool)->ET.Element :
+    # https://www.openstreetmap.org/way/513097887 defines an id='1nh5Cbt9_EsnMhdH5T3hnPXQguY=' !!!
+    # do not let it overwrite row_dict['id']
+    TAGS_FORBIDDEN_OVERWRITE=('id','members')
     rel=ET.Element('relation',{'id':str(row_dict['id'])})
     #collapse hstore tags
     try :
         for k,v in row_dict.pop('json_tags').items() :
-            row_dict[k]=v
+            if k not in TAGS_FORBIDDEN_OVERWRITE :
+                row_dict[k]=v
         for k,v in row_dict.pop('json_tags2').items() :
-            row_dict[k]=v
+            if k not in TAGS_FORBIDDEN_OVERWRITE :
+                row_dict[k]=v
     except KeyError :
         pass
     try :
@@ -755,12 +761,17 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         l.log(count,'/',len(ids),'rels','    ',percent(count,len(ids)),clearline=True)
 
 def way_to_xml(row_dict:dict)->ET.Element :
+    # https://www.openstreetmap.org/way/513097887 defines an id='1nh5Cbt9_EsnMhdH5T3hnPXQguY=' !!!
+    # do not let it overwrite row_dict['id']
+    TAGS_FORBIDDEN_OVERWRITE=('id','nodes')
     #collapse hstore tags 
     try :
         for k,v in row_dict.pop('json_tags').items() :
-            row_dict[k]=v
+            if k not in TAGS_FORBIDDEN_OVERWRITE :
+                row_dict[k]=v
         for k,v in row_dict.pop('json_tags2').items() :
-            row_dict[k]=v
+            if k not in TAGS_FORBIDDEN_OVERWRITE :
+                row_dict[k]=v
     except KeyError :
         pass
     way=ET.Element('way',{'id':str(row_dict['id'])})
