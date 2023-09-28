@@ -74,10 +74,8 @@ available in databases created by `osm2pgsql`>=1.9)
 
 ### Benchmarks 
 
-* Example export of `Switzerland.osm.bz2` takes about 2 hours, the database access
-uses a constant 4-6GB RAM and the script itself reaches about 4GB RAM. Output is
-then about 1GB when bzip2-compressed
-* Germany-Bavaria in 3.5h and `.osm.bz2` is 1.8GB.
+* `Switzerland.osm.bz2` is `694MB` in `real 1h08min/user 32mim/sys 22min`
+* `Germany-Bavaria.osm.bz2` is `2.2GB`, in `real 6h49min/user 1h36min/sys 2h49min`.
 
 Disclaimer
 ---
