@@ -26,7 +26,7 @@ def regions_lookup(isocode:str) :
             if r_d[i].find(isocode)>=0 :
                 if r_d[i]==isocode :
                     return r_d[headers.index('name')],r_d[headers.index('osm_id')]
-    print('Error iso boundary not found:',isocode)
+    print('Error iso boundary not found:',isocode,file=sys.stderr)
     exit(1)
 
 class Settings :
@@ -65,7 +65,6 @@ class Settings :
             for test_name_end in test_endings :
                 if name.endswith(test_name_end) :
                     n_end=test_name_end
-            print(name)
             if n_end==None :
                 continue
             name=row_dict['schema']+'.'+row_dict['name']
@@ -586,7 +585,7 @@ async def stream_osm_xml(s:Settings) :
     l.next_phase() #children
     # do we want big forests ? yes even outside the bounds
     ## TODO: move config to Settings
-    rels_children_nwr(s,accumulator,only_multipolygon_rels=True,without_rels=True)
+    rels_children_nwr(s,accumulator,only_multipolygon_rels=True,without_rels=False)
     ways_children_n(s,accumulator)
 
     counts=[len(accumulator[i])for i in ('nodes','ways','rels')]
