@@ -172,6 +172,14 @@ class Logger() :
         self.check_ready()
         self.current_phase+=1
 
+    def save_clearedline(self) :
+        ''' Simply write a newline at the end of the previous clearline: save it.
+        Warning, will garbe output if not preceded by a clearline=True log call.
+        '''
+        print(end='\n',file=sys.stderr)
+        #same behaviour whether followed by a clearline or not
+        self.previous_clearline=False
+
     def log(self,*msg:typing.Any,clearline=False,prependline=False) :
         ''' Like print, accept a list of Any-typed items and print their .__str__()
         space-separated. Keeps track of the current phase.
@@ -535,14 +543,12 @@ def rels_children_nwr(s:Settings,accumulator:dict,only_multipolygon_rels=False,w
             l.log(node_count,'nodes,',way_count,'ways,',rel_count,'rels children of rel',tot_count,'/',
                 len(accumulator['rels']),'    ',percent(tot_count,len(accumulator['rels'])),clearline=True)
         if without_rels :
-            l.log('collected',node_count,'nodes,',way_count,'ways,',rel_count,'rels',
-                'from',len(accumulator['rels']),'rels children')
+            l.save_clearedline()
             return #after first run
         for rel_id in buffer_add_rels :
             accumulator['rels'].add(rel_id)
         tot_count=0 #reset counter to make only count up to 100% not 200%
-    l.log('collected',node_count,'nodes,',way_count,'ways,',rel_count,'rels',
-        'children of',len(accumulator['rels']),'rels')
+    l.save_clearedline()
 
 def ways_children_n(s:Settings,accumulator:dict) :
     # 4b) foreach way_id: add all its nodes[] ids
@@ -561,7 +567,7 @@ def ways_children_n(s:Settings,accumulator:dict) :
     #end write line with 100%
     l.log(node_count,'nodes children of way',way_count,'/',len(accumulator['ways']),
         '    ',percent(way_count,len(accumulator['ways'])),clearline=True)
-    l.log('collected',node_count,'nodes,','children of',len(accumulator['ways']),'ways')
+    l.save_clearedline()
 
 
 async def stream_osm_xml(s:Settings) :
@@ -616,8 +622,6 @@ async def stream_osm_xml(s:Settings) :
 
 def rel_to_xml(row_dict:dict,tags:dict,new_jsonb_schema:bool)->ET.Element :
     # separate tags and row_dict, see way_to_xml()
-    if row_dict['id'] in (12713637,9211119,9211118) :
-        l.log('RELATION!',row_dict,tags,new_jsonb_schema)
     attrs,col_tags=split_tags_out(row_dict,('id','members'))
     rel=ET.Element('relation',{'id':str(attrs['id'])})
     if 'members' in attrs :
@@ -682,6 +686,10 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
         tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
         yield rel_to_xml(row_dict,tags,s.new_jsonb_schema)
+        if s.debug_xml :
+            yield ET.Element('debug',{'previous':str(row_dict['id']),
+                'done_ids_len':str(len(done_ids)),'ids_len':str(len(ids)),
+                'table':table_name})
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
 
@@ -749,6 +757,10 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         else :
             tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
         yield rel_to_xml(row_dict,tags,s.new_jsonb_schema)
+        if s.debug_xml :
+            yield ET.Element('debug',{'previous':str(row_dict['id']),
+                'done_ids_len':str(len(done_ids)),'ids_len':str(len(ids)),
+                'table':table_name})
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
     l.log('rels _line output end',(time.time()-start_t))
@@ -779,6 +791,10 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         #collapse hstore tags 
         tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
         yield rel_to_xml(row_dict,tags,s.new_jsonb_schema)
+        if s.debug_xml :
+            yield ET.Element('debug',{'previous':str(row_dict['id']),
+                'done_ids_len':str(len(done_ids)),'ids_len':str(len(ids)),
+                'table':table_name})
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',
                 percent(len(done_ids),len(ids)),clearline=True)
@@ -999,6 +1015,8 @@ async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
             if len(done_ids)%16==0 :
                 l.log(len(done_ids),'/',len(ids),'nodes','    ',
                     percent(len(done_ids),len(ids)),clearline=True)
+    l.log(len(done_ids),'/',len(ids),'nodes','    ',
+        percent(len(done_ids),len(ids)),clearline=True)
 
 def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Collection] :
     ''' Return sets of items yielded by generator of length at
