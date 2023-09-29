@@ -72,9 +72,10 @@ available in databases created by `osm2pgsql`>=1.9)
 
 Extract | File size | `time` | elements count | RAM
 ---|---|---|---|---
-`Switzerland.osm.bz2` | `694MB` | `real 1h08min/user 32min/sys 22min` | `46.7M n, 5.46M w, 80K r` | -
-`Switzerland-onlymultipolygonrels.osm.bz2` | `694MB` | `real 1h04min/user 33min/sys 21min` | `46.7M n, 5.28M w, 79.8K r` | -
-`Germany-Bavaria.osm.bz2` | `2.2GB` | `real 6h49min/user 1h36min/sys 2h49min` | `136M n, 19.2M w, 164K r` | -
+`Switzerland.osm.bz2`|`694MB`|`real 1h08min`<br>`user 32min`<br>`sys 22min`|`46.7M n`<br>`5.46M w`<br>`80K r`| -
+`Switzerland-onlymultipolygonrels.osm.bz2`|`694MB`|`real 1h04min`<br>`user 33min`<br>`sys 21min`|`46.7M n`<br>`5.28M w`<br>`79.8K r`| -
+`Switzerland-allrels-relchildrels.osm.bz2`|`1.3GB`|`real 4h06min`<br>`user 1h08min`<br>`sys 1h43min`|`87.2M n`<br>`9.83M w`<br>`125K r`|`17.3GB`
+`Germany-Bavaria.osm.bz2`|`2.2GB`|`real 6h49min`<br>`user 1h36min`<br>`sys 2h49min`|`136M n`<br>`19.2M w`<br>`164K r`| -
 
 
 _Note_ : The File size is for the possibly compressed extract, bzip2 default settings used unless
