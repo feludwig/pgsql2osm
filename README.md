@@ -25,27 +25,25 @@ Requirements
 
 * `python3`
   - `pip install psycopg2`
-* database was imported with `osm2pgsql` and
-  - is imported in `--slim` mode (this allows incremental updates and is also leveraged by `pgsql2osm.py`)
-<=> has the "middle" layout tables containing all the osm references between
-`ways->nodes` and `rels->nodes,ways,rels`,
-  - _Recommended_ : was imported with `--hstore` containing all remaining tags
-not saved as columns in the `tags` hstore
-  - The geometry tables' names end with `\_point`, `\_line`, `\_polygon`
+
+#### Database
+
+* was imported with `osm2pgsql`
+* in `--slim` mode (this allows incremental updates and is also leveraged by `pgsql2osm.py`)
+* _Recommended_ : with `--hstore` containing all remaining tags
+not saved as columns in the `tags::hstore`
+* The geometry tables' names end with `_point`, `_line`, `_polygon`
 and have a nonzero `srid` for their respective geometry column
-(these are `osm2pgsql` default settings).
+(these are `osm2pgsql` default settings),
+and are the biggest in the database by used space with those suffixes
+(if you happen to have a `smaller_extract_point` table or view).
 To check, see that those tables are present in the result of the following:
 
 
 `SELECT f_table_name,f_geometry_column,srid FROM geometry_columns WHERE srid!=0;`
 
-  - The "middle" database tables have names ending in `_ways` and `_rels`
-(`osm2pgsql` defaults), and are
-the biggest in the database by used space
-  - with `--flat-nodes`, and access to the `--flat-nodes <FILE>` cache binary file (for now, must be readwrite)
-* `SELECT` access granted on the above mentioned tables and also
-(for the autodetections of table names and column names)
-`pg_attribute`, `pg_tables`, `pg_type`, `pg_class`, and `geometry_columns`.
+* with `--flat-nodes`, and access to the `--flat-nodes <FILE>` cache binary file (for now, must be readwrite)
+
 
 Features
 ---
@@ -54,10 +52,10 @@ Features
 Example:
 
 
-`python3 -u pgsql2osm.py --dsn 'user=username dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2`
+`python3 -u pgsql2osm.py --dsn 'dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2`
 * Attempt to lower RAM footprint with generators for database queries:
 streaming all the way from database to XML
-* Automatic detection of table names, referred to here as `planet_osm_* , but they can also
+* Automatic detection of table names, referred to here as `planet_osm_*` , but they can also
 be named anything with the correct suffixes added by `osm2pgsql`: `\_point`, `\_line`, `\_polygon`,
 `\_ways` and `\_rels`
 * Automatic detection of the middle database format (legacy text[] or new jsonb,
@@ -74,13 +72,24 @@ available in databases created by `osm2pgsql`>=1.9)
 
 ### Benchmarks 
 
-* `Switzerland.osm.bz2` is `694MB` in `real 1h08min/user 32min/sys 22min`
-for `46.7M nodes, 5.46M ways, 80K rels`.
-  - `Switzerland-onlymultipolygonrels.osm.bz2` also `694MB`
-in `real 1h04min/user 33min/sys 21min`
-for `46.7M nodes, 5.28M ways, 79.8K rels`
-* `Germany-Bavaria.osm.bz2` is `2.2GB`, in `real 6h49min/user 1h36min/sys 2h49min`
-for `136M nodes, 19.2M ways, 164K rels`.
+Extract | File size | `time` | elements count | RAM
+---|---|---|---|---
+`Switzerland.osm.bz2` | `694MB` | `real 1h08min/user 32min/sys 22min` | `46.7M n, 5.46M w, 80K r` | -
+`Switzerland-onlymultipolygonrels.osm.bz2` | `694MB` | \
+`real 1h04min/user 33min/sys 21min` | `46.7M n, 5.28M w, 79.8K r`
+`Germany-Bavaria.osm.bz2` | `2.2GB` | \
+`real 6h49min/user 1h36min/sys 2h49min` | `136M n, 19.2M w, 164K r`
+
+
+_Note_ : The File size is for the possibly compressed extract, bzip2 default settings used unless
+otherwise noted
+
+#### RAM usage monitoring
+
+I just run the following to get the max RAM used by that process 
+
+
+`maxmemkb=0;while sleep 1;do memkb="$(ps -Ao rss,cmd|grep python3|grep pgsql2osm|cut -d' ' -f1)";if [ "${maxmemkb}" -lt "${memkb}" ];then maxmemkb="${memkb}";fi;printf '\033[2K\r%s max=%s' "${memkb}" "${maxmemkb}";done`
 
 Disclaimer
 ---
@@ -95,9 +104,9 @@ hundreds of kilometers beyond the boundary if that is a continuous entity
 
 ### Unsorted ids
 
-The output ids are streamed in the order they come from the database, and for spped reasons
+The output ids are streamed in the order they come from the database, and for speed reasons
 this is unsorted. If you need a sorted `.osm`, use
-[osmium](https://osmcode.org/osmium-tool/) :
+[`osmium`](https://osmcode.org/osmium-tool/) after exporting:
 
 
 `osmium sort in.osm.bz2  --output=out.osm.bz2`
@@ -112,6 +121,7 @@ Currently, uncompressed `.osm` output files bigger than about a gigabyte error o
 when used by `OsmAndMapCreator`.
 
 ### Unreliable output
+
 The output data may have some missing attributes, because the database import
 is not a lossless operation: importing a `.osm.pbf` to database, then exporting
 it to `.osm` and then converting it back to `.osm.pbf` will produce a **different** file.
@@ -119,7 +129,7 @@ it to `.osm` and then converting it back to `.osm.pbf` will produce a **differen
 
 The data from the database is straightforwardly reinterpreted to mean key=value
 osm tags. This is not strictly the case, for example the cycleway and bicycle
-tags. Currently no back-transformations, to compensate for lua transforms,
+tags. Currently no back-transformations, to compensate for import-time lua transforms,
 are performed on the data.
 
 Installation
@@ -142,7 +152,41 @@ reports as percentages
 Implementation details
 --
 
-* To generate `regions.csv`, run in a planet database:
+### Database details
+
+* `osm2pgsql`'s `--slim` mode means: has the "middle" layout tables containing all the osm references between
+`ways->nodes` and `rels->nodes,ways,rels`, more specifically:
+* The "middle" database tables have names ending in `_ways` and `_rels`
+(`osm2pgsql` defaults),
+and are the biggest with that suffix in the database, by used space
+* The `*_ways` table has columns
+  - `id::bigint` for the osm ID,
+  - `nodes::bigint[]` for a list of the way's child nodes,
+  - and `tags::text[]` for that way's tags in hstore format,
+  - with `tags::jsonb` in the case of the new jsonb format.
+* The `*_rels` table has columns
+  - `id::bigint` for the osm ID,
+  - in the case of legacy text[] format:
+    * `parts::bigint[]` any ids of (mixed) nodes,
+ways or relations that are children of that relation,
+    * `tags::text[]` for the relation's tags in hstore format,
+    * `members::text[]` that more precisely describes the children,
+example `{'n123','admin_centre','w345','outer','w567','inner'}`
+having the node `123` as a role `admin_centre` and the ways `345` and `567`,
+as roles `outer` and `inner` boundaries respectively
+  - in the case of new jsonb format:
+    * `members::jsonb` a list of json objects describing the members, the example continued
+`[{"ref":"123","role":"admin_centre","type":"N"},{"ref":"345","role":"outer","type":"W"},
+{"ref":"567","role":"inner","type":"W"}]`,
+    * and `tags::jsonb` for the relation's tags in `{"key1":"value1","key2":"value2"}` format,
+
+* Access needed: `SELECT` granted on the above mentioned tables and also
+(for the autodetections of table names and column names)
+`pg_attribute`, `pg_tables`, `pg_type`, `pg_class`, and `geometry_columns`.
+
+#### Regions.csv
+
+To generate `regions.csv`, run in a planet database:
 
 
 `psql -d gis -p 5432 --csv -c "select -osm_id as osm_id,coalesce(tags->'name:en',name) as name,
@@ -152,9 +196,10 @@ Implementation details
     and boundary='administrative'" > regions.csv`
 
 
-  - _Note_ : only admin_level<=4 is loaded into `regions.csv`.
-Use a search on [openstreetmap.org](openstreetmap.org) for smaller regions.
+_Note_ : only `admin_level`<=4 is loaded into `regions.csv`.
+Use a search on [openstreetmap.org](https://www.openstreetmap.org) for smaller regions.
 And then extract the relation id from the url:
 [https://www.openstreetmap.org/relation/\<N\>](https://www.openstreetmap.org/relation/51701)
 eg Switzerland
+
 
