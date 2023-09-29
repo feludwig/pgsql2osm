@@ -32,6 +32,7 @@ def regions_lookup(isocode:str) :
 class Settings :
     def __init__(self,args:argparse.Namespace) :
         self.debug=args.debug
+        self.debug_xml=False
 
         self.bounds_geojson=args.bounds_geojson
         self.bounds_rel_id=args.bounds_rel_id
@@ -215,12 +216,12 @@ def percent(numer:int,denom:int)->str :
 
 async def chain(*generators:typing.Iterator)->typing.Iterator:
     for g in generators :
-        try :
+        if not hasattr(g,'__anext__') :
             #async does not like 'yield from' syntax, but this works
             for i in g :
                 yield i
-        #is an asyncio generator
-        except TypeError :
+        else :
+            #is an asyncio generator
             async for i in g :
                 yield i
 
@@ -613,28 +614,19 @@ async def stream_osm_xml(s:Settings) :
             ) :
                 xml_out.write(el)
 
-def rel_to_xml(row_dict:dict,new_jsonb_schema:bool)->ET.Element :
-    # https://www.openstreetmap.org/way/513097887 defines an id='1nh5Cbt9_EsnMhdH5T3hnPXQguY=' !!!
-    # do not let it overwrite row_dict['id']
-    TAGS_FORBIDDEN_OVERWRITE=('id','members')
-    rel=ET.Element('relation',{'id':str(row_dict['id'])})
-    #collapse hstore tags
-    try :
-        for k,v in row_dict.pop('json_tags').items() :
-            if k not in TAGS_FORBIDDEN_OVERWRITE :
-                row_dict[k]=v
-        for k,v in row_dict.pop('json_tags2').items() :
-            if k not in TAGS_FORBIDDEN_OVERWRITE :
-                row_dict[k]=v
-    except KeyError :
-        pass
-    try :
+def rel_to_xml(row_dict:dict,tags:dict,new_jsonb_schema:bool)->ET.Element :
+    # separate tags and row_dict, see way_to_xml()
+    if row_dict['id'] in (12713637,9211119,9211118) :
+        l.log('RELATION!',row_dict,tags,new_jsonb_schema)
+    attrs,col_tags=split_tags_out(row_dict,('id','members'))
+    rel=ET.Element('relation',{'id':str(attrs['id'])})
+    if 'members' in attrs :
         if new_jsonb_schema :
-            for m in row_dict.pop('members') :
+            for m in attrs.pop('members') :
                 trsl={'N':'node','W':'way','R':'relation'}
                 ET.SubElement(rel,'member',{'type':trsl[m['type']],'ref':str(m['ref']),'role':m['role']})
         else :
-            m=iter(row_dict.pop('members'))
+            m=iter(attrs.pop('members'))
             while True :
                 try :
                     mixed_id=next(m)
@@ -644,18 +636,21 @@ def rel_to_xml(row_dict:dict,new_jsonb_schema:bool)->ET.Element :
                     ET.SubElement(rel,'member',{'type':osm_type,'ref':str(id),'role':role})
                 except StopIteration :
                     break
-    except KeyError :
-        pass
-    for k,v in row_dict.items() :
-        if k not in ('nodes','id') :
-            # make sure a float like v=18.572e6 does not have the 'e' in str() -> YES: "18572000.0"
-            ET.SubElement(rel,'tag',{'k':str(k),'v':str(v)})
+    have_keys=set()
+    for t in (tags,col_tags) :
+        for k,v in tags.items() :
+            if k not in have_keys :
+                # make sure a float like v=18.572e6 does not have the 'e' in str() -> YES: "18572000.0"
+                ET.SubElement(rel,'tag',{'k':str(k),'v':str(v)})
+                have_keys.add(k)
     return rel
 
 def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     tbl_rels=s.tables['_rels']['name']
+    done_ids=set()
+
     table_name=s.tables['_polygon']['name']
-    l.log(0,'/',len(ids),'rels, reading table',table_name,'...')
+    l.log(len(done_ids),'/',len(ids),'rels, reading table',table_name,'...')
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         # we need to merge the _polygon tags with the _rels tags.
@@ -674,15 +669,19 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     # the JOIN makes this query incredibly slow...
     # BUT ONLY "ON osm_id=-id", and "ON -osm_id=id" is fast...
 
-    done_ids=set()
     # psql does not have an index on -osm_id and does not understand *=-1 is bijective.
     #therevore  checking -osm_id IN (id1,id2,id3) is super slow, but
     # osm_id IN (-id1,-id2,-id3) is fast. But it needs some more memory in python to
     # store the negatives copy as well
+    if s.debug_xml :
+        yield ET.Element('debug',{'status':'starting polygon query'})
     for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
         if row_dict['id'] in done_ids :
             continue
-        yield rel_to_xml(row_dict,s.new_jsonb_schema)
+        #collapse hstore tags 
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
+        tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
+        yield rel_to_xml(row_dict,tags,s.new_jsonb_schema)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
 
@@ -696,8 +695,6 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     
-    start_t=time.time()
-    l.log('rels _line output start',start_t)
     #TEMP: there seems to be no index on _line! so we do additional queries one by one when double_query_mode==True
     double_query_mode=True
     if not double_query_mode :
@@ -726,19 +723,32 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
             query2=f'SELECT hstore_to_json(tags::hstore) AS json_tags2,members FROM {tbl_rels} WHERE id=' #need to append id
         cursor2=s.access.cursor() # need a second cursor here
 
-    done_ids=set()
     # psql does not have an index on -osm_id and does not understand *=-1 is bijective.
     #therevore  checking -osm_id IN (id1,id2,id3) is super slow, but
     # osm_id IN (-id1,-id2,-id3) is fast. But it needs some more memory in python to
     # store the negatives copy as well
-    for row_dict in g_query_ids(s.c,query,list(-i for i in ids),'osm_id',step=250) :
+    first=True
+    if s.debug_xml :
+        yield ET.Element('debug',{'status':'starting line query'})
+    for row_dict in g_query_ids(s.c,query,
+            list(-i for i in ids if i not in done_ids),'osm_id',step=250) :
+        if first :
+            start_t=time.time()
+            l.log('rels _line output start',start_t)
+            first=False
+
         if row_dict['id'] in done_ids :
             continue
+        #collapse hstore tags 
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
         if double_query_mode :
             cursor2.execute(query2+str(row_dict['id']))
             #add this missing data, ORDER important
-            row_dict['json_tags2'],row_dict['members']=cursor2.fetchone()
-        yield rel_to_xml(row_dict,s.new_jsonb_schema)
+            json_tags2,row_dict['members']=cursor2.fetchone()
+            tags={**tags,**json_tags2}
+        else :
+            tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
+        yield rel_to_xml(row_dict,tags,s.new_jsonb_schema)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'rels','    ',percent(len(done_ids),len(ids)),clearline=True)
     l.log('rels _line output end',(time.time()-start_t))
@@ -748,6 +758,10 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         if i not in done_ids :
             missing_ids.add(i)
 
+    if len(missing_ids)==0 :
+        l.log(len(done_ids),'/',len(ids),'rels','    ',
+                percent(len(done_ids),len(ids)),clearline=True)
+        return
     table_name=tbl_rels
     l.log(len(done_ids),'/',len(ids),'rels, reading table',table_name,'...')
     if s.new_jsonb_schema :
@@ -755,37 +769,35 @@ def create_relations(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     else :
         #in this table, tags is ::text[], not a hstore
         query=f'SELECT id,members,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
-    count=len(done_ids)+0
     #bigger step than previous, because there is (heurisitcally) less data for these "light" relations,
     # which have no interesting tags regarding rendering making them worthy of a place in _polygon or _line
+    if s.debug_xml :
+        yield ET.Element('debug',{'status':'starting rels query'})
     for row_dict in g_query_ids(s.c,query,list(missing_ids),'id',step=300) :
-        yield rel_to_xml(row_dict,s.new_jsonb_schema)
-        count+=1
-        l.log(count,'/',len(ids),'rels','    ',percent(count,len(ids)),clearline=True)
+        if row_dict['id'] in done_ids :
+            continue
+        #collapse hstore tags 
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
+        yield rel_to_xml(row_dict,tags,s.new_jsonb_schema)
+        done_ids.add(row_dict['id'])
+        l.log(len(done_ids),'/',len(ids),'rels','    ',
+                percent(len(done_ids),len(ids)),clearline=True)
 
-def way_to_xml(row_dict:dict)->ET.Element :
+def way_to_xml(row_dict:dict,tags:dict)->ET.Element :
+    attrs,col_tags=split_tags_out(row_dict,('id','nodes'))
+    # KEEP tags and row_dict separate:
     # https://www.openstreetmap.org/way/513097887 defines an id='1nh5Cbt9_EsnMhdH5T3hnPXQguY=' !!!
-    # do not let it overwrite row_dict['id']
-    TAGS_FORBIDDEN_OVERWRITE=('id','nodes')
-    #collapse hstore tags 
-    try :
-        for k,v in row_dict.pop('json_tags').items() :
-            if k not in TAGS_FORBIDDEN_OVERWRITE :
-                row_dict[k]=v
-        for k,v in row_dict.pop('json_tags2').items() :
-            if k not in TAGS_FORBIDDEN_OVERWRITE :
-                row_dict[k]=v
-    except KeyError :
-        pass
-    way=ET.Element('way',{'id':str(row_dict['id'])})
-    try :
-        for nd in row_dict['nodes'] :
+
+    way=ET.Element('way',{'id':str(attrs['id'])})
+    if 'nodes' in attrs:
+        for nd in attrs['nodes'] :
             ET.SubElement(way,'nd',{'ref':str(nd)})
-    except KeyError :
-        pass
-    for k,v in row_dict.items() :
-        if k not in ('nodes','id') :
-            ET.SubElement(way,'tag',{'k':str(k),'v':str(v)})
+    have_keys=set()
+    for t in (tags,col_tags) :
+        for k,v in t.items() :
+            if k not in have_keys :
+                ET.SubElement(way,'tag',{'k':str(k),'v':str(v)})
+                have_keys.add(k)
     return way
 
 def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
@@ -808,7 +820,10 @@ def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
         if row_dict['id'] in done_ids :
             continue
-        yield way_to_xml(row_dict)
+        #collapse hstore tags 
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
+        tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
+        yield way_to_xml(row_dict,tags)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'ways','    ',percent(len(done_ids),len(ids)),clearline=True)
 
@@ -824,10 +839,14 @@ def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     query+=f',{tbl_ways}.nodes FROM {table_name} JOIN {tbl_ways}'
     query+=f' ON {table_name}.osm_id={tbl_ways}.id'
 
-    for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
+    for row_dict in g_query_ids(s.c,query,
+            list(i for i in ids if i not in done_ids),'osm_id') :
         if row_dict['id'] in done_ids :
             continue
-        yield way_to_xml(row_dict)
+        #collapse hstore tags 
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
+        tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
+        yield way_to_xml(row_dict,tags)
         done_ids.add(row_dict['id'])
         l.log(len(done_ids),'/',len(ids),'ways','    ',percent(len(done_ids),len(ids)),clearline=True)
 
@@ -844,11 +863,14 @@ def create_ways(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         query=f'SELECT id,nodes,tags AS json_tags FROM {table_name}'
     else :
         query=f'SELECT id,nodes,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
-    count=len(done_ids)+0
     for row_dict in g_query_ids(s.c,query,list(missing_ids),'id') :
-        yield way_to_xml(row_dict)
-        count+=1
-        l.log(count,'/',len(ids),'ways','    ',percent(count,len(ids)),clearline=True)
+        if row_dict['id'] in done_ids :
+            continue
+        #collapse hstore tags 
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
+        yield way_to_xml(row_dict,tags)
+        done_ids.add(row_dict['id'])
+        l.log(len(done_ids),'/',len(ids),'ways','    ',percent(len(done_ids),len(ids)),clearline=True)
 
 
 def g_from_cursor(c:psycopg2.extensions.cursor,verbose=False,prefix_msg='')->typing.Iterator[dict]:
@@ -912,6 +934,32 @@ def get_columns_of_types(c:psycopg2.extensions.cursor,
     for colname,strtype in c.fetchall() :
         yield table_name+'.'+('"'+colname+'"' if colname.find(':')>0 else colname)
 
+def node_to_xml(row_dict:dict,tags:dict)->ET.Element :
+    attrs,col_tags=split_tags_out(row_dict,('id','lat','lon'))
+    attrs['id']=str(attrs['id'])
+    node=ET.Element('node',attrs)
+    have_keys=set()
+    for t in (tags,col_tags) :
+        for k,v in t.items() :
+            if k not in have_keys :
+                ET.SubElement(node,'tag',{'k':str(k),'v':str(v)})
+                have_keys.add(k)
+    return node
+
+def split_tags_out(row_dict:dict,keep_keys:typing.Collection[str])->typing.Collection[dict] :
+    ''' Given a row_dict, it also contains tags from the database columns.
+    Separate the row_dict into row_dict with known keys, and tags with all
+    other keys.
+    '''
+    dest_dict={}
+    tags={}
+    for k,v in row_dict.items() :
+        if k in keep_keys :
+            dest_dict[k]=v
+        else :
+            tags[k]=v
+    return (dest_dict,tags,)
+
 async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
     table_name=s.tables['_point']['name']
     l.log(0,'/',len(ids),'nodes, reading table',table_name,'...',clearline=True)
@@ -922,38 +970,35 @@ async def create_nodes(s:Settings,ids:list)->typing.Iterator[ET.Element] :
         *list(get_columns_of_types(s.c,('int4','int','int8','int16','text'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))+f' FROM {table_name}'
-    done_nodes=set()
+    done_ids=set()
     for row_dict in g_query_ids(s.c,query,ids,'osm_id') :
-        # in str, a number with 9999 end digits will waste space.
+        if row_dict['id'] in done_ids :
+            continue
+        # extract the json_tags into tags
+        tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
+        # as a str, a number with 9999 end digits will waste space.
         # change all lat/lons :7.543702599999998->7.5437026.
         # 10 digit degrees is +- 0.011mm precision
-        row_attrs={k:str(round(row_dict[k],10)) for k in ('lat','lon')}
-        row_attrs['id']=str(row_dict['id'])
-        # expand the json_tags to the tags and remove 'json_tags'
-        try :
-            for k,v in row_dict.pop('json_tags').items() :
-                row_dict[k]=v
-        except KeyError :
-            pass
-        node=ET.Element('node',row_attrs)
-        for k,v in row_dict.items() :
-            if k not in row_attrs :
-                ET.SubElement(node,'tag',{'k':str(k),'v':str(v)})
-        done_nodes.add(row_dict['id'])
-        yield node
-        if len(done_nodes)%32==0 :
-            l.log(len(done_nodes),'/',len(ids),'nodes','    ',
-                percent(len(done_nodes),len(ids)),clearline=True)
+        row_add={k:str(round(row_dict[k],10)) for k in ('lat','lon')}
+        yield node_to_xml({**row_dict,**row_add},tags)
+        done_ids.add(row_dict['id'])
+        if len(done_ids)%32==0 :
+            l.log(len(done_ids),'/',len(ids),'nodes','    ',
+                percent(len(done_ids),len(ids)),clearline=True)
     l.log('now querying flatnodes file for missing nodes')
     to_get_lat_lons=set()
 
-    count=len(done_nodes)+0
-    for batch in g_batches((i for i in ids if i not in done_nodes),5_000) :
+    for batch in g_batches((i for i in ids if i not in done_ids),5_000) :
         async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch,s) :
-            yield ET.Element('node',{'id':str(osm_id),'lat':lat,'lon':lon})
-            count+=1
-            if count%16==0 :
-                l.log(count,'/',len(ids),'nodes','    ',percent(count,len(ids)),clearline=True)
+            #osm_id,lat and lon are already strings (don't bother to convert+reconvert them)
+            osm_id_int=int(osm_id)
+            if osm_id_int in done_ids :
+                continue
+            yield node_to_xml({'id':osm_id,'lat':lat,'lon':lon},{})
+            done_ids.add(osm_id_int)
+            if len(done_ids)%16==0 :
+                l.log(len(done_ids),'/',len(ids),'nodes','    ',
+                    percent(len(done_ids),len(ids)),clearline=True)
 
 def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Collection] :
     ''' Return sets of items yielded by generator of length at
