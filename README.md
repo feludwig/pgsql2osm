@@ -1,8 +1,7 @@
 # pgsql2osm
 Export .osm from a PostgreSQL openstreetmap database
 
-Motivation
----
+## Motivation
 
 You have access to a PostgreSQL+PostGIS database which contains openstreetmap
 data imported by
@@ -20,8 +19,7 @@ app, chained with
 ([guide](https://github.com/osmandapp/web/blob/main/main/docs/technical/map-creation/create-offline-maps-yourself.md))
 for `.osm` -> `.obf`.
 
-Requirements
----
+## Requirements
 
 * `python3`
   - `pip install psycopg2`
@@ -42,11 +40,11 @@ To check, see that those tables are present in the result of the following:
 
 `SELECT f_table_name,f_geometry_column,srid FROM geometry_columns WHERE srid!=0;`
 
-* with `--flat-nodes`, and access to the `--flat-nodes <FILE>` cache binary file (for now, must be readwrite)
+* with `--flat-nodes`, and access to the `--flat-nodes <FILE>` cache binary file
+(for now, must be readwrite)
 
 
-Features
----
+## Features
 
 * XML streaming output, allows to only store compressed .osm.bz2 on disk and not waste RAM.
 Example:
@@ -75,10 +73,8 @@ available in databases created by `osm2pgsql`>=1.9)
 Extract | File size | `time` | elements count | RAM
 ---|---|---|---|---
 `Switzerland.osm.bz2` | `694MB` | `real 1h08min/user 32min/sys 22min` | `46.7M n, 5.46M w, 80K r` | -
-`Switzerland-onlymultipolygonrels.osm.bz2` | `694MB` | \
-`real 1h04min/user 33min/sys 21min` | `46.7M n, 5.28M w, 79.8K r`
-`Germany-Bavaria.osm.bz2` | `2.2GB` | \
-`real 6h49min/user 1h36min/sys 2h49min` | `136M n, 19.2M w, 164K r`
+`Switzerland-onlymultipolygonrels.osm.bz2` | `694MB` | `real 1h04min/user 33min/sys 21min` | `46.7M n, 5.28M w, 79.8K r` | -
+`Germany-Bavaria.osm.bz2` | `2.2GB` | `real 6h49min/user 1h36min/sys 2h49min` | `136M n, 19.2M w, 164K r` | -
 
 
 _Note_ : The File size is for the possibly compressed extract, bzip2 default settings used unless
@@ -91,8 +87,7 @@ I just run the following to get the max RAM used by that process
 
 `maxmemkb=0;while sleep 1;do memkb="$(ps -Ao rss,cmd|grep python3|grep pgsql2osm|cut -d' ' -f1)";if [ "${maxmemkb}" -lt "${memkb}" ];then maxmemkb="${memkb}";fi;printf '\033[2K\r%s max=%s' "${memkb}" "${maxmemkb}";done`
 
-Disclaimer
----
+## Disclaimers
 
 ### Outside of bounds geometries
 The bounding region will include every entity and all its dependent entities.
@@ -132,8 +127,7 @@ osm tags. This is not strictly the case, for example the cycleway and bicycle
 tags. Currently no back-transformations, to compensate for import-time lua transforms,
 are performed on the data.
 
-Installation
----
+# Installation
 
 * you need the `get_lonlat` utility, for that you need to have compiled
 libosm2pgsql.a ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#building))
@@ -149,8 +143,7 @@ libosm2pgsql.a ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#buildi
 _Note_ : the `-u` option enables python unbuffered I/O, for the live progress
 reports as percentages
 
-Implementation details
---
+## Implementation details
 
 ### Database details
 
