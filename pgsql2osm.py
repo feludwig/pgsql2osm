@@ -411,6 +411,7 @@ async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
         yield (osm_id,y,x)
 
 def all_nwr_within(s:Settings,a:Accumulator) :
+    #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
     # 1a) select all nodes WHERE way ST_Within(bbox);
     constr,tbl_name=s.make_bounds_constr('_point')
     l.log('executing big query on',tbl_name,'...',clearline=True)
@@ -433,7 +434,7 @@ def all_nwr_within(s:Settings,a:Accumulator) :
 
     # 1c) select all ways,rels FROM planet_osm_line WHERE way ST_Within(bbox);
     # planet_osm_roads is not needed in that fashion, because it is a strict subset
-    # of planet_osm_line, and we're only collecting ids of objects for now
+    # of planet_osm_line
     constr,tbl_name=s.make_bounds_constr('_line')
     l.log('executing big query on',tbl_name,'...',clearline=True)
     s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
@@ -642,28 +643,32 @@ async def stream_osm_xml(s:Settings) :
     #nodes within are a subset of nodes: copy of nodes just after all_nwr_within was run
     a=DictAccumulator(('nodes','nodes_within','ways','rels','done_ids'))
 
-    #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
+    #NOTE: only nodes existing in _point are selected: they are
+    #   about 5% of all nodes usually
     all_nwr_within(s,a)
-    #copy
+    #copy [~100K tagged_nodes, ~300K ways, ~7K rels]
     for i in a.all('nodes') :
         a.add('nodes_within',i)
 
     l.next_phase() #children
 
     ## TODO: move config to Settings
-    #WITHOUT rel->child:rel because you end up including Novosibirsk from Switzerland
+    # [+0K nodes, +60K ways, +0K rels] only_multipolygon_rels=True,without_rels=True
     rels_children_nwr(s,a,only_multipolygon_rels=True,without_rels=True)
+    # [+3.2M nodes]
     ways_children_n(s,a)
+    # we now have: [~3.3M nodes, ~350K ways, ~7K rels]
 
     if with_parents :
         l.next_phase() #parents
+        # [+40K ways, +1K rels]
         nodes_parent_wr(s,a,only_nodes_within=True)
         #ways_parent_r(s,a)
 
     l.next_phase() #write
-    l.log('n122317 is in',a.is_in('nodes',122317))
     counts=[a.len(i)for i in ('nodes','ways','rels')]
     l.log('dumping',counts[0],'nodes,',counts[1],'ways,',counts[2],'rels in total')
+    # we now have: [~3.3M nodes, ~400K ways, ~8K rels] with_parents=True
 
     # ONLY after all ids have been resolved, do we actually query the data,
     # RAM-inefficient otherwise; more RAM-inefficient for bigger extracts.
