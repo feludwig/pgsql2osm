@@ -51,6 +51,7 @@ class Accumulator() :
         scanned_nodes_count it the amount of nodes processed by this tuple.
         '''
         nix=self.named_data.index(name)
+        len_ids=self.len(name)
 
         total_processed_nodes=0
         start_chunk_size=50 #const
@@ -63,9 +64,11 @@ class Accumulator() :
         # took too long
         c.execute("SET statement_timeout='1s';")
         printed_slow_warning=False
+        ids_as_list=list(self.data[name])
         while total_processed_nodes<len_ids :
             start_time=time.time()
-            nodes_chunk=self.get_iter_slice(nix,total_processed_nodes,total_processed_nodes+chunk_size)
+            #nodes_chunk=self.get_iter_slice(nix,total_processed_nodes,total_processed_nodes+chunk_size)
+            nodes_chunk=ids_as_list[total_processed_nodes:total_processed_nodes+chunk_size]
             # maybe rewrite logic to NOT NEED len(nodes_chunk), then we could
             # have it be a generator
             # but we need to store the str=','.join(ids) anyways...
@@ -249,8 +252,9 @@ class Settings :
 
     def make_bounds_constr(self,table_key:str)->typing.Collection[str] :
         ''' Lookup the table_key in self.tables and return the
-        "way && ST_MakeEnvelope(x1,y2,x2,y2)" part of a query for the specific
-        table table_key, and its fully qualified name.
+        "ST_Intersects(way, ST_MakeEnvelope(x1,y2,x2,y2))" part of a query for the specific
+        table table_key, and its fully qualified name. NOTE: avoid using && operator
+        because that only considers the bounding box hull of the boundary!
         Also account for SRID differences (osm data usually stored in 3857, latlon is 4326)
         with ST_Transform().
         '''
@@ -261,8 +265,8 @@ class Settings :
             with open(self.bounds_geojson,'r') as f :
                 geojson=f.read().strip()
             way_constr=f"ST_GeomFromGeoJSON('{geojson}'::jsonb)"
-            way_constr_a=f'{way_column}&&ST_Transform({way_constr},{tgt_srid})'
-            #way_constr_b=f'ST_Intersects(way,ST_Transform({way_constr},3857))'
+            #way_constr_a=f'{way_column}&&ST_Transform({way_constr},{tgt_srid})'
+            way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
         elif self.bounds_rel_id!=None :
             osm_rel_id=self.bounds_rel_id
             from_rel_id=True
@@ -275,8 +279,9 @@ class Settings :
             from_rel_id=True
         elif self.bounds_box!=None :
             lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
-            way_constr_a=f'{way_column}&&ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),{tgt_srid})'
-            #way_constr_b=f'ST_Intersects(way,ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857))'
+            #way_constr_a=f'{way_column}&&ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),{tgt_srid})'
+            way_constr=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
+            way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
             #way_constr=f'way && ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857)'
         else :
             l.log('Error: no boundary provided.')
@@ -286,9 +291,11 @@ class Settings :
             #relation ids are stored negative
             relbound_way_col=self.tables['_polygon']['geom']
             relbound_name=self.tables['_polygon']['name'] #stores negative osm_ids for relations
-            way_constr_a=f'{way_column}&&(SELECT relbound.{relbound_way_col} FROM {relbound_name} AS relbound WHERE osm_id={-osm_rel_id})'
-            #way_constr_b=f'ST_Intersects(way,(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id}))'
-        return way_constr_a,self.tables[table_key]['name']
+            #way_constr_a=f'{way_column}&&(SELECT relbound.{relbound_way_col} FROM {relbound_name} AS relbound WHERE osm_id={-osm_rel_id})'
+            assert tgt_srid==self.tables['_polygon']['srid'], 'Unsupported cross-table different geometry SRIDs'
+            way_constr=f'(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
+            way_constr=f'ST_Intersects({way_column},{way_constr})'
+        return way_constr,self.tables[table_key]['name']
 
 
     async def test(self) :
@@ -439,11 +446,12 @@ def all_nwr_within(s:Settings,a:Accumulator) :
     l.log(a.len('ways'),'ways,',a.len('rels'),'rels within bounds')
 
     
-def nodes_parent_wr(s:Settings,a:Accumulator) :
+def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
     # 2a) foreach node_id :
     # 2b) select all ways WHERE ARRAY[node_id]::bigint[] <@ nodes;
     # 2c) select all rels WHERE ARRAY[node_id]::bigint[] <@ parts;
-    l.log('checking parent ways of',a.len('nodes'),'nodes')
+    nodes_name='nodes_within' if only_nodes_within else 'nodes'
+    l.log('checking parent ways of',a.len(nodes_name),'nodes')
     way_count=0
     rel_count=0
     node_count=0
@@ -472,16 +480,15 @@ def nodes_parent_wr(s:Settings,a:Accumulator) :
         rels_query=f'SELECT id FROM ({parts_indexed}) AS parts_indexed WHERE {members_where};'
         rels_lambdas=(lambda i:','.join(map(str,i)),lambda i:','.join(map(lambda j:f"'n{j}'",i)),)
     
-    for node_c,way_ids,rel_ids in g_adaptive_parent_multiquery(s.c,
-            a.all('nodes'),
+    for node_c,way_ids,rel_ids in a.g_adaptive_parent_multiquery(nodes_name,s.c,
             ('SELECT id FROM '+tbl_ways+' WHERE '+add_buck+'ARRAY[{0}]::bigint[] && nodes;',
                 rels_query),
             [(lambda i:','.join(map(str,i)),),rels_lambdas]) :
         node_count+=node_c
         if node_count%8==0 :
             l.log(way_count,'ways,',rel_count,
-                'rels parents of node',node_count,'/',a.len('nodes'),
-                '    ',percent(node_count,a.len('nodes')),clearline=True)
+                'rels parents of node',node_count,'/',a.len(nodes_name),
+                '    ',percent(node_count,a.len(nodes_name)),clearline=True)
         for way in way_ids:
             way_count+=1
             a.add('ways',way['id'])
@@ -508,7 +515,7 @@ def ways_parent_r(s:Settings,a:Accumulator) :
         rels_query=f'SELECT id FROM ({parts_indexed}) AS parts_indexed WHERE {members_where};'
         rels_lambdas=(lambda i:','.join(map(str,i)),lambda i:','.join(map(lambda j:f"'w{j}'",i)),)
 
-    for way_c,rel_ids in g_adaptive_parent_multiquery(s.c,a.all('ways'),
+    for way_c,rel_ids in a.g_adaptive_parent_multiquery('ways',s.c,
             (rels_query,),[rels_lambdas]) :
         way_count+=way_c
         for rel in rel_ids:
@@ -523,8 +530,7 @@ def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,with
     ''' Going over all rel ids in accumulator, read every rel's members[] array and add all its
     children, according to their type: node/way/relation, to the accumulator.
     without_rels==True means to disregard the rel's children that are rels.
-    only_multipolygon_rels==True means to only add the children of rels that
-    are type="multipolygon".
+    only_multipolygon_rels==True means to only scan rels that are type="multipolygon".
     '''
     # 4) BACKpropagation: resolve to take in all rels->ways->nodes
     # 4a) foreach rel_id: add all its members'ids as n{id} -> node, w{id} -> way, or r{id} -> rel
@@ -602,10 +608,13 @@ def ways_children_n(s:Settings,a:Accumulator) :
     node_count=0
     for way_id in a.all('ways') :
         way_count+=1
-        s.c.execute(f'SELECT nodes FROM {s.tables["_ways"]["name"]} WHERE id={way_id};')
+        s.c.execute(f'SELECT id,nodes FROM {s.tables["_ways"]["name"]} WHERE id={way_id};')
         for row in g_from_cursor(s.c) :
             for i in row['nodes'] :
                 a.add('nodes',i)
+                if i==122317 :
+                    l.log('n122317 is in',a.is_in('nodes',122317))
+                    l.log('FROM way',row['id'],'which has',len(row['nodes']),'nodes')
                 node_count+=1
         if way_count%32==0 :
             l.log(node_count,'nodes children of way',way_count,'/',a_len('ways'),
@@ -625,33 +634,40 @@ async def stream_osm_xml(s:Settings) :
     See --help for s.bounds.
     '''
     ## TODO: move this config to Settings
-    with_parents=False
-    phases=['within','parents','children','write']
+    with_parents=True
+    phases=['within','children','parents','write']
     if not with_parents :
         phases.remove('parents')
     l.set_phases(phases)
-    #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
-    a=DictAccumulator(('nodes','ways','rels','done_ids'))
+    #nodes within are a subset of nodes: copy of nodes just after all_nwr_within was run
+    a=DictAccumulator(('nodes','nodes_within','ways','rels','done_ids'))
 
+    #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
     all_nwr_within(s,a)
-    if with_parents :
-        l.next_phase() #parents
-        nodes_parent_wr(s,a)
-        ways_parent_r(s,a)
+    #copy
+    for i in a.all('nodes') :
+        a.add('nodes_within',i)
 
     l.next_phase() #children
-    # do we want big forests ? yes even outside the bounds
+
     ## TODO: move config to Settings
-    rels_children_nwr(s,a,only_multipolygon_rels=False,without_rels=False)
+    #WITHOUT rel->child:rel because you end up including Novosibirsk from Switzerland
+    rels_children_nwr(s,a,only_multipolygon_rels=True,without_rels=True)
     ways_children_n(s,a)
 
+    if with_parents :
+        l.next_phase() #parents
+        nodes_parent_wr(s,a,only_nodes_within=True)
+        #ways_parent_r(s,a)
+
+    l.next_phase() #write
+    l.log('n122317 is in',a.is_in('nodes',122317))
     counts=[a.len(i)for i in ('nodes','ways','rels')]
     l.log('dumping',counts[0],'nodes,',counts[1],'ways,',counts[2],'rels in total')
 
     # ONLY after all ids have been resolved, do we actually query the data,
     # RAM-inefficient otherwise; more RAM-inefficient for bigger extracts.
     # do more of a streaming from database to file approach
-    l.next_phase() #write
     out_file=sys.stdout.buffer if s.out_file=='-' else s.out_file
     with ET.xmlfile(out_file,encoding='utf-8') as xml_out :
         xml_out.write_declaration()
@@ -982,6 +998,8 @@ def g_query_ids(c:psycopg2.extensions.cursor,query:str,ids:typing.Iterator[int],
             except StopIteration :
                 finished=True # out of the while
                 break #out of the for 
+        if len(buf)==0 :
+            continue
         query=f'{init_query} {with_and} {id_col} IN ('
         query+=','.join(buf)
         query+=');'
