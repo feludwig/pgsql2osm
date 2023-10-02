@@ -73,18 +73,19 @@ regardless of the original tag's key.
     * `grep -i MY regions.csv` can show you recognized iso codes for Malaysia and subregions
   - osm relation id `--osm-rel-id N`, for any relation in the database.
   - geojson polygon input file `--geojson file.geojson`
-  - bounding box `--box='<lon_from>,<lat_from>,<lon_to>,<lat_to>'`
+  - bounding box `--bbox='<lon_from>,<lat_from>,<lon_to>,<lat_to>'`
 * Anti-Feature: unsorted ids, see [Unsorted ids](#unsorted-ids)
 
 ### Benchmarks 
 
 Extract | File size | `time` | elements count | RAM
 ---|---|---|---|---
-Switzerland.osm.bz2|694MB|real 1h08<br>user 32min<br>sys 22min|46.7M n<br>5.46M w<br>80K r| -
-Switzerland-onlymultipolygonrels.osm.bz2|694MB|real 1h04<br>user 33min<br>sys 21min|46.7M n<br>5.28M w<br>79.8K r| -
-Switzerland-allrels-relchildrels.osm.bz2|1.3GB|real 4h06<br>user 1h08<br>sys 1h43|87.2M n<br>9.83M w<br>125K r|`17.3GB`
-Germany-Bavaria.osm.bz2|2.2GB|real 6h49<br>user 1h36<br>sys 2h49|136M n<br>19.2M w<br>164K r| -
+~~Switzerland.osm.bz2|694MB|real 1h08<br>user 32min<br>sys 22min|46.7M n<br>5.46M w<br>80K r| -~~
+~~Switzerland-onlymultipolygonrels.osm.bz2|694MB|real 1h04<br>user 33min<br>sys 21min|46.7M n<br>5.28M w<br>79.8K r| -~~
+~~Switzerland-allrels-relchildrels.osm.bz2|1.3GB|real 4h06<br>user 1h08<br>sys 1h43|87.2M n<br>9.83M w<br>125K r|17.3GB~~
+~~Germany-Bavaria.osm.bz2|2.2GB|real 6h49<br>user 1h36<br>sys 2h49|136M n<br>19.2M w<br>164K r| -~~
 Switzerland-newalgorithm.osm.bz2|692MB|real 2h35<br>user 39min<br>sys 45min|47.1M n<br>5.3M w<br>94.5K r| -
+Germany-bavaria-newalgorithm.osm.bz2|1.1GB|real 5h17<br>user 1h06<br>sys 1h35|70.1M n<br>10.5M w<br>95.8K r|12.1GB
 
 
 _Note_ : The File size is for the possibly compressed extract, bzip2 default settings used unless
