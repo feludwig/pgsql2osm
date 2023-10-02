@@ -10,6 +10,10 @@ for rendering maps. How can you generate an extract
 to use with other cartography tools ?
 `pgsql2osm.py` is an experimental tool that can generate the XML in `.osm` format
 for all entities within given boundaries.
+It attempts to preserve all data attributes from original osm data:
+nodes, ways and relations and all their `osm_id`s, all tags, and
+interreferences (references to the outside of the extract you choose will be broken,
+use `--bbox='-180,-89.99,180,89.99'` to select all available data).
 
 
 The main usecase I have for this is to generate an `.obf` file for the Android
@@ -54,12 +58,16 @@ Example:
 * Attempt to lower RAM footprint with generators for database queries:
 streaming all the way from database to XML
 * Automatic detection of table names, referred to here as `planet_osm_*` , but they can also
-be named anything with the correct suffixes added by `osm2pgsql`: `\_point`, `\_line`, `\_polygon`,
-`\_ways` and `\_rels`
+be named anything with the correct suffixes added by `osm2pgsql`: `_point`, `_line`, `_polygon`,
+`_ways` and `_rels`
 * Automatic detection of the middle database format (legacy text[] or new jsonb,
 available in databases created by `osm2pgsql`>=1.9)
 * Automatic detection of `planet_osm_point`, `planet_osm_line` and
 `planet_osm_polygon` columns: a specific `.style` at import is not required
+  - _Warning_ : The column names you choose will be the keys in the `.osm` output
+regardless of the original tag's key.
+  - _Note_ : key-values in `tags` override column key-values
+
 * Bounds specifiable as _either_ :
   - iso country or region code `--iso de-by` for Germany/Bayern
     * `grep -i MY regions.csv` can show you recognized iso codes for Malaysia and subregions
@@ -76,6 +84,7 @@ Switzerland.osm.bz2|694MB|real 1h08<br>user 32min<br>sys 22min|46.7M n<br>5.46M 
 Switzerland-onlymultipolygonrels.osm.bz2|694MB|real 1h04<br>user 33min<br>sys 21min|46.7M n<br>5.28M w<br>79.8K r| -
 Switzerland-allrels-relchildrels.osm.bz2|1.3GB|real 4h06<br>user 1h08<br>sys 1h43|87.2M n<br>9.83M w<br>125K r|`17.3GB`
 Germany-Bavaria.osm.bz2|2.2GB|real 6h49<br>user 1h36<br>sys 2h49|136M n<br>19.2M w<br>164K r| -
+Switzerland-newalgorithm.osm.bz2|692MB|real 2h35<br>user 39min<br>sys 45min|47.1M n<br>5.3M w<br>94.5K r| -
 
 
 _Note_ : The File size is for the possibly compressed extract, bzip2 default settings used unless
