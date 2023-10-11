@@ -143,6 +143,7 @@ class DictAccumulator(Accumulator) :
         self.data={k:set() for k in self.named_data}
 
     def add(self,k,i) :
+        assert i>0 and isinstance(i,int), f'Unsupported type or zero or negative value {i}'
         self.data[k].add(i)
     def all(self,k) :
         return iter(self.data[k])
@@ -257,10 +258,13 @@ class Settings :
         because that only considers the bounding box hull of the boundary!
         Also account for SRID differences (osm data usually stored in 3857, latlon is 4326)
         with ST_Transform().
+        ALSO: bbox can be specified in addition to any of the other bounds: make an
+        intersection then
         '''
         from_rel_id=False
         tgt_srid=self.tables[table_key]['srid']
         way_column=self.tables[table_key]['geom']
+        way_constr=None
         if self.bounds_geojson!=None :
             with open(self.bounds_geojson,'r') as f :
                 geojson=f.read().strip()
@@ -277,16 +281,7 @@ class Settings :
                 l.log(f"Suggested output filename: '{c_name}.osm'")
             osm_rel_id=int(osm_rel_id)
             from_rel_id=True
-        elif self.bounds_box!=None :
-            lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
-            #way_constr_a=f'{way_column}&&ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),{tgt_srid})'
-            way_constr=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
-            way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
-            #way_constr=f'way && ST_Transform(ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326),3857)'
-        else :
-            l.log('Error: no boundary provided.')
-            l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
-            exit(1)
+
         if from_rel_id :
             #relation ids are stored negative
             relbound_way_col=self.tables['_polygon']['geom']
@@ -295,6 +290,22 @@ class Settings :
             assert tgt_srid==self.tables['_polygon']['srid'], 'Unsupported cross-table different geometry SRIDs'
             way_constr=f'(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
             way_constr=f'ST_Intersects({way_column},{way_constr})'
+        
+        if self.bounds_box!=None and way_constr==None :
+            lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
+            way_constr=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
+            way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
+        elif self.bounds_box!=None and way_constr!=None :
+            # INTERSECTION between already bounds and current bbox:
+            lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
+            way_constr_bbox=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
+            way_constr_bbox=f'ST_Intersects({way_column},ST_Transform({way_constr_bbox},{tgt_srid}))'
+            way_constr=f'{way_constr} AND {way_constr_bbox}'
+
+        else :
+            l.log('Error: no boundary provided.')
+            l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
+            exit(1)
         return way_constr,self.tables[table_key]['name']
 
 
@@ -1141,7 +1152,9 @@ if __name__=='__main__' :
     #one of the following:
     parser.add_argument('-b','--bbox',dest='bounds_box',
         default=None,type=str,
-        help='Rectangle boundary in the format lon_from,lat_from,lon_to,lat_to')
+        help='''Rectangle boundary in the format lon_from,lat_from,lon_to,lat_to.
+Can be specified in addition to other boundaries, and will then extract the intersection.
+Info: use quotes with negative numbers, eg --bbox='-180,-89,180,89'.''')
     parser.add_argument('-r','--osm-rel-id',dest='bounds_rel_id',
         default=None,type=int,
         help='Integer for the osm relation that should make the boundary')
@@ -1163,4 +1176,7 @@ if __name__=='__main__' :
 
     args=parser.parse_args()
     s=Settings(args)
-    t=asyncio.run(stream_osm_xml(s))
+    try :
+        t=asyncio.run(stream_osm_xml(s))
+    except ZeroDivisionError :
+        print('\nError: boundary is empty or database has no data within',file=sys.stderr)
