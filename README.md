@@ -74,14 +74,18 @@ regardless of the original tag's key.
   - osm relation id `--osm-rel-id N`, for any relation in the database.
   - geojson polygon input file `--geojson file.geojson`
   - bounding box `--bbox='<lon_from>,<lat_from>,<lon_to>,<lat_to>'`
+* Bounds intersection can be specified as one non-`bbox` of the above and a `--bbox`.
+The extracted region will then be the intersection (logical AND) of the shape with the bbox.
 * Anti-Feature: unsorted ids, see [Unsorted ids](#unsorted-ids)
 
 ### Benchmarks 
 
 Extract | File size | `time` | elements count | RAM
 ---|---|---|---|---
-Baden-württemberg.osm.bz2<br>`--bbox='-180,-89,180,48.31'`|274M|real 49min<br>user 16min<br>sys 5min<br>|17.2M n<br>2.53M w<br>32.6K r| -
-Baden-württemberg.osm.bz2<br>`--bbox='-180,48.29,180,89'`|560M|real 2h08<br>user 34min<br>sys 21min<br>|34.0M n<br>5.84M w<br>63K r|6.1GB
+Baden-württemberg.osm.bz2<br>`--bbox='-180,-89,180,48.31'`|274MB|real 49min<br>user 16min<br>sys 5min<br>|17.2M n<br>2.53M w<br>32.6K r| -
+Baden-württemberg.osm.bz2<br>`--bbox='-180,48.29,180,89'`|560MB|real 2h08<br>user 34min<br>sys 21min<br>|34.0M n<br>5.84M w<br>63K r|6.1GB
+Austria-left14.25.osm.bz2<br>`--bbox='-180,-89,14.26,89'`|509MB|real 1h21<br>user 21min<br>sys 22min|34.6M n<br>3.31M w<br>53K r|5.7GB
+Austria-right14.25.osm.bz2<br>`--bbox='14.24,-89,180,89'`|676MB|real 2h11<br>user 30min<br>sys 46min|45.4M n<br>5.27M w<br>89K r|10.7GB
 Switzerland-newalgorithm.osm.bz2|692MB|real 2h35<br>user 39min<br>sys 45min|47.1M n<br>5.3M w<br>94.5K r| -
 Germany-bavaria-newalgorithm.osm.bz2|1.1GB|real 5h17<br>user 1h06<br>sys 1h35|70.1M n<br>10.5M w<br>95.8K r|12.1GB
 
