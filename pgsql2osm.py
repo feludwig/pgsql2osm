@@ -302,7 +302,7 @@ class Settings :
             way_constr_bbox=f'ST_Intersects({way_column},ST_Transform({way_constr_bbox},{tgt_srid}))'
             way_constr=f'{way_constr} AND {way_constr_bbox}'
 
-        else :
+        if way_constr==None :
             l.log('Error: no boundary provided.')
             l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
             exit(1)
