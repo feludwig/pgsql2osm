@@ -27,6 +27,7 @@ for `.osm` -> `.obf`.
 
 * `python3`
   - `pip install psycopg2`
+  - `pip install lxml`
 
 #### Database
 
