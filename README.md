@@ -159,6 +159,24 @@ libosm2pgsql.a ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#buildi
 _Note_ : the `-u` option enables python unbuffered I/O, for the live progress
 reports as percentages
 
+# Python usage
+
+Also useable without the CLI, from another python script. Example:
+```
+#when pgsql2osm is a subdirectory
+import pgsql2osm.pgsql2osm as pgsql2osm
+m=pgsql2osm.ModuleSettings(
+  bounds_rel_id=osm_rel_id,
+  get_lonlat_binary='/path/to/get_lonlat',
+  nodes_file='/path/to/planet.bin.nodes',
+  # no need for the --dsn if access already from somewhere else
+  access=already_previously_obtained_dbaccess)
+with bz2.open('test.osm.bz2','wb') as f:
+  m.out_file=f #set the output file object
+  m.main()
+```
+__Note__: will still print progress reports to stderr
+
 ## Implementation details
 
 ### Database details
