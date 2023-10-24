@@ -9,7 +9,6 @@ import json
 import asyncio
 
 import sys
-import argparse
 
 ##TODO
 
@@ -199,6 +198,10 @@ class Settings :
         self.out_file=args.out_file
         
         self.access=psycopg2.connect(args.postgres_dsn)
+
+        self.connect_and_check()
+
+    def connect_and_check(self) :
         #use one cursor for everything
         self.c=self.access.cursor()
         self.c.execute('''SELECT f_table_name AS name,f_table_schema AS schema,
@@ -247,12 +250,11 @@ class Settings :
 
         print('INFO:','detected middle database layout:','new jsonb' if self.new_jsonb_schema else 'legacy text[]',file=sys.stderr)
         asyncio.run(self.test())
-        print('[ start ]',time.strftime('%F_%T'),file=sys.stderr)
         self.has_suggested_out_filename=False #only print suggestion once
 
 
     def make_bounds_constr(self,table_key:str)->typing.Collection[str] :
-        ''' Lookup the table_key in self.tables and return the
+        """ Lookup the table_key in self.tables and return the
         "ST_Intersects(way, ST_MakeEnvelope(x1,y2,x2,y2))" part of a query for the specific
         table table_key, and its fully qualified name. NOTE: avoid using && operator
         because that only considers the bounding box hull of the boundary!
@@ -260,7 +262,7 @@ class Settings :
         with ST_Transform().
         ALSO: bbox can be specified in addition to any of the other bounds: make an
         intersection then
-        '''
+        """
         from_rel_id=False
         tgt_srid=self.tables[table_key]['srid']
         way_column=self.tables[table_key]['geom']
@@ -308,17 +310,46 @@ class Settings :
             exit(1)
         return way_constr,self.tables[table_key]['name']
 
+    def main(self) :
+        """ Handle all the asyncio stuff for stream_osm_xml(), only returns when
+        everything is finished
+        """
+        try :
+            t=asyncio.run(stream_osm_xml(self))
+        except ZeroDivisionError :
+            print('\nError: boundary is empty or database has no data within',file=sys.stderr)
 
     async def test(self) :
-        ''' Test: checks if get_lonlat exsits, is executable.
+        """ Test: checks if get_lonlat exsits, is executable.
             And the get_lonlat execution will crash if planet.bin.nodes is
             not readwrite or does not exist.
-        '''
+        """
         result=[]
         async for i in get_latlon_str_from_flatnodes(('2185493801','3546766428'),self) :
             result.append(i)
         return result
 
+class ModuleSettings(Settings) :
+    """ Pass the stream_osm_xml() a ModuleSettings if you directly want to
+    give python objects instead of using the CLI and argparse
+        * supported feature: 'out_file' can be any open file python object
+    WARNING: danger zone, requirement is not checked! if you forget to set some
+    settings value, this script may crash just before the end!
+    """
+    def __init__(self,**kwargs):
+        #something not in keys will be ignored, dict value is default value
+        keys={'debug':False,'debug_xml':False,'bounds_geojson':None,
+                'bounds_rel_id':None,'bounds_iso':None,'bounds_box':None,
+                'get_lonlat_binary':None,'nodes_file':None,'out_file':None,
+                'access':None,'postgres_dsn':None,
+        }
+        for k,v in kwargs.items() :
+            if k in keys :
+                setattr(self,k,v)
+        for k,v in keys.items() :
+            if not hasattr(self,k) :
+                setattr(self,k,v)
+        self.connect_and_check()
 
 class Logger() :
     def __init__(self) :
@@ -647,10 +678,13 @@ async def stream_osm_xml(s:Settings) :
     '''
     ## TODO: move this config to Settings
     with_parents=True
-    phases=['within','children','parents','write']
+    phases=['start','within','children','parents','write']
     if not with_parents :
         phases.remove('parents')
     l.set_phases(phases)
+    l.log(time.strftime('%F_%T'))
+    l.next_phase() #start within
+
     #nodes within are a subset of nodes: copy of nodes just after all_nwr_within was run
     a=DictAccumulator(('nodes','nodes_within','ways','rels','done_ids'))
 
@@ -697,6 +731,7 @@ async def stream_osm_xml(s:Settings) :
                     create_relations(s,a),
             ) :
                 xml_out.write(el)
+    print(file=sys.stderr)
 
 def rel_to_xml(row_dict:dict,tags:dict,new_jsonb_schema:bool)->ET.Element :
     # separate tags and row_dict, see way_to_xml()
@@ -1138,7 +1173,7 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
 l=Logger() #global variable
 
 if __name__=='__main__' :
-
+    import argparse
     parser=argparse.ArgumentParser(prog='pgsql2osm')
 
     parser.add_argument('get_lonlat_binary',
@@ -1176,7 +1211,4 @@ Info: use quotes with negative numbers, eg --bbox='-180,-89,180,89'.''')
 
     args=parser.parse_args()
     s=Settings(args)
-    try :
-        t=asyncio.run(stream_osm_xml(s))
-    except ZeroDivisionError :
-        print('\nError: boundary is empty or database has no data within',file=sys.stderr)
+    s.main()
