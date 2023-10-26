@@ -9,6 +9,7 @@ import json
 import asyncio
 
 import sys
+import argparse
 
 ##TODO
 
@@ -248,7 +249,7 @@ class Settings :
         else :
             assert len(t_schema)==2, 'Could not decide which middle db schema is used'
 
-        print('INFO:','detected middle database layout:','new jsonb' if self.new_jsonb_schema else 'legacy text[]',file=sys.stderr)
+        l.log_start('INFO: detected middle database layout = '+('new jsonb' if self.new_jsonb_schema else 'legacy text[]'))
         asyncio.run(self.test())
         self.has_suggested_out_filename=False #only print suggestion once
 
@@ -271,7 +272,6 @@ class Settings :
             with open(self.bounds_geojson,'r') as f :
                 geojson=f.read().strip()
             way_constr=f"ST_GeomFromGeoJSON('{geojson}'::jsonb)"
-            #way_constr_a=f'{way_column}&&ST_Transform({way_constr},{tgt_srid})'
             way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
         elif self.bounds_rel_id!=None :
             osm_rel_id=self.bounds_rel_id
@@ -288,7 +288,6 @@ class Settings :
             #relation ids are stored negative
             relbound_way_col=self.tables['_polygon']['geom']
             relbound_name=self.tables['_polygon']['name'] #stores negative osm_ids for relations
-            #way_constr_a=f'{way_column}&&(SELECT relbound.{relbound_way_col} FROM {relbound_name} AS relbound WHERE osm_id={-osm_rel_id})'
             assert tgt_srid==self.tables['_polygon']['srid'], 'Unsupported cross-table different geometry SRIDs'
             way_constr=f'(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
             way_constr=f'ST_Intersects({way_column},{way_constr})'
@@ -299,6 +298,9 @@ class Settings :
             way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
         elif self.bounds_box!=None and way_constr!=None :
             # INTERSECTION between already bounds and current bbox:
+            # actually doing an ST_IntersectION means postgresql cannot optimize it as well.
+            # the AND structure is much faster (and query planner agrees as well) ->
+            #   cost 1000x lower from 188'000 to 239
             lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
             way_constr_bbox=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
             way_constr_bbox=f'ST_Intersects({way_column},ST_Transform({way_constr_bbox},{tgt_srid}))'
@@ -312,8 +314,9 @@ class Settings :
 
     def main(self) :
         """ Handle all the asyncio stuff for stream_osm_xml(), only returns when
-        everything is finished
+        everything is finished. Can be run multiple times
         """
+        self.has_suggested_out_filename=False
         try :
             t=asyncio.run(stream_osm_xml(self))
         except ZeroDivisionError :
@@ -360,8 +363,6 @@ class Logger() :
     def check_ready(self) :
         assert self._ready, 'Need to run .set_phases first'
     def set_phases(self,phases:typing.Collection[str]) :
-        if self._ready :
-            raise ValueError('Cannot .set_phases multiple times')
         self.phases=phases
         self.str_maxlen_phase=max(list(map(len,phases)))
         self.current_phase=0 #index into phases list
@@ -408,6 +409,9 @@ class Logger() :
         print(str_msg,end=('' if clearline else ' ' if prependline else '\n'),file=sys.stderr)
         self.previous_prependline=prependline
         self.previous_clearline=clearline
+
+    def log_start(self,str_msg) :
+        print('[ start ]',str_msg,file=sys.stderr)
 
 def percent(numer:int,denom:int)->str :
     ''' Return the str(float(numer/denom)*100) with 3 sigfigs,
@@ -678,11 +682,11 @@ async def stream_osm_xml(s:Settings) :
     '''
     ## TODO: move this config to Settings
     with_parents=True
-    phases=['start','within','children','parents','write']
+    phases=['within','children','parents','write']
     if not with_parents :
         phases.remove('parents')
     l.set_phases(phases)
-    l.log(time.strftime('%F_%T'))
+    l.log_start(time.strftime('%F_%T'))
     l.next_phase() #start within
 
     #nodes within are a subset of nodes: copy of nodes just after all_nwr_within was run
@@ -884,6 +888,9 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'table':table_name})
         add_done_ids(row_dict['id'])
         l.log(a_len('done_ids'),'/',len_ids,'rels','    ',percent(a_len('done_ids'),len_ids),clearline=True)
+    if first :
+        #edgecase when query returned 0 items
+        start_t=time.time()
     l.log('rels _line output end',(time.time()-start_t))
 
     table_name=tbl_rels
@@ -1173,7 +1180,6 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
 l=Logger() #global variable
 
 if __name__=='__main__' :
-    import argparse
     parser=argparse.ArgumentParser(prog='pgsql2osm')
 
     parser.add_argument('get_lonlat_binary',
