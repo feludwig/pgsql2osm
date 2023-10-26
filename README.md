@@ -8,7 +8,9 @@ data imported by
 [`osm2pgsql`](https://osm2pgsql.org/)
 for rendering maps. How can you generate an extract
 to use with other cartography tools ?
-`pgsql2osm.py` is an experimental tool that can generate the XML in `.osm` format
+
+
+`pgsql2osm.py` is a script that can generate the XML in `.osm` format
 for all entities within given boundaries.
 It attempts to preserve all data attributes from original osm data:
 nodes, ways and relations and all their `osm_id`s, all tags, and
