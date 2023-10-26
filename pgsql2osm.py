@@ -371,6 +371,9 @@ class Logger() :
     def next_phase(self) :
         self.check_ready()
         self.current_phase+=1
+        if self.current_phase>=len(self.phases) :
+            self.current_phase=0
+            l.log(f'WARNING: Called .next_phase() too many times with {self.phases}. resetting')
 
     def save_clearedline(self) :
         ''' Simply write a newline at the end of the previous clearline: save it.
@@ -680,14 +683,13 @@ async def stream_osm_xml(s:Settings) :
     any way.
     See --help for s.bounds.
     '''
+    l.log_start(time.strftime('%F_%T'))
     ## TODO: move this config to Settings
     with_parents=True
     phases=['within','children','parents','write']
     if not with_parents :
         phases.remove('parents')
     l.set_phases(phases)
-    l.log_start(time.strftime('%F_%T'))
-    l.next_phase() #start within
 
     #nodes within are a subset of nodes: copy of nodes just after all_nwr_within was run
     a=DictAccumulator(('nodes','nodes_within','ways','rels','done_ids'))
