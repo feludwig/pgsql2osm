@@ -85,8 +85,8 @@ The extracted region will then be the intersection (logical AND) of the shape wi
 
 Extract | File size | `time` | elements count | RAM
 ---|---|---|---|---
-Austria-left15\_0.osm.bz2<br>`--bbox='-180,-89,15.01,89'`|681MB|46.7M n<br>4.54M w<br>75K r|real 2h18<br>user 37min<br>sys 42min|10.6GB
-Austria-right15\_0.osm.bz2<br>`--bbox='14.99,-89,180,89'`|502MB|33.1M n<br>4.01M w<br>67K r|real 1h23<br>user 23min<br>sys 17min| -
+Austria-left15\_0.osm.bz2<br>`--bbox='-180,-89,15.01,89'`|681MB|real 2h18<br>user 37min<br>sys 42min|46.7M n<br>4.54M w<br>75K r|10.6GB
+Austria-right15\_0.osm.bz2<br>`--bbox='14.99,-89,180,89'`|502MB|real 1h23<br>user 23min<br>sys 17min|33.1M n<br>4.01M w<br>67K r| -
 Baden-württemberg.osm.bz2<br>`--bbox='-180,-89,180,48.31'`|274MB|real 49min<br>user 16min<br>sys 5min<br>|17.2M n<br>2.53M w<br>32.6K r| -
 Baden-württemberg.osm.bz2<br>`--bbox='-180,48.29,180,89'`|560MB|real 2h08<br>user 34min<br>sys 21min<br>|34.0M n<br>5.84M w<br>63K r|6.1GB
 Austria-left14.25.osm.bz2<br>`--bbox='-180,-89,14.26,89'`|509MB|real 1h21<br>user 21min<br>sys 22min|34.6M n<br>3.31M w<br>53K r|5.7GB
