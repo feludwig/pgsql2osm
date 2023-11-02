@@ -91,8 +91,8 @@ Baden-württemberg.osm.bz2<br>`--bbox='-180,-89,180,48.31'`|274MB|real 49min<br>
 Baden-württemberg.osm.bz2<br>`--bbox='-180,48.29,180,89'`|560MB|real 2h08<br>user 34min<br>sys 21min<br>|34.0M n<br>5.84M w<br>63K r|6.1GB
 Austria-left14.25.osm.bz2<br>`--bbox='-180,-89,14.26,89'`|509MB|real 1h21<br>user 21min<br>sys 22min|34.6M n<br>3.31M w<br>53K r|5.7GB
 Austria-right14.25.osm.bz2<br>`--bbox='14.24,-89,180,89'`|676MB|real 2h11<br>user 30min<br>sys 46min|45.4M n<br>5.27M w<br>89K r|10.7GB
-Switzerland-newalgorithm.osm.bz2|692MB|real 2h35<br>user 39min<br>sys 45min|47.1M n<br>5.3M w<br>94.5K r| -
-Germany-bavaria-newalgorithm.osm.bz2|1.1GB|real 5h17<br>user 1h06<br>sys 1h35|70.1M n<br>10.5M w<br>95.8K r|12.1GB
+Switzerland.osm.bz2|692MB|real 2h35<br>user 39min<br>sys 45min|47.1M n<br>5.3M w<br>94.5K r| -
+Germany-bavaria.osm.bz2|1.1GB|real 5h17<br>user 1h06<br>sys 1h35|70.1M n<br>10.5M w<br>95.8K r|12.1GB
 
 
 _Note_ : The File size is for the compressed extract, bzip2 default settings used unless
@@ -102,8 +102,12 @@ otherwise noted
 
 I just run the following to get the max RAM used by that process 
 
-
-`maxmemkb=0;while sleep 1;do memkb="$(ps -Ao rss,cmd|grep python3|grep pgsql2osm|cut -d' ' -f1)";if [ "${maxmemkb}" -lt "${memkb}" ];then maxmemkb="${memkb}";fi;printf '\033[2K\r%s max=%s' "${memkb}" "${maxmemkb}";done`
+```
+maxmemkb=0;while sleep 1;do
+  memkb="$(ps -Ao rss,cmd|grep python3|grep pgsql2osm|cut -d' ' -f1)";
+  if [ "${maxmemkb}" -lt "${memkb}" ];then maxmemkb="${memkb}";fi;
+  printf '\033[2K\r%s max=%s' "${memkb}" "${maxmemkb}";done
+```
 
 ## Disclaimers
 
@@ -122,7 +126,9 @@ this is unsorted. If you need a sorted `.osm`, use
 [`osmium`](https://osmcode.org/osmium-tool/) after exporting:
 
 
-`osmium sort in.osm.bz2  --output=out.osm.bz2`
+```
+osmium sort in.osm.bz2  --output=out.osm.bz2
+```
 
 
 ### Output may change
@@ -147,16 +153,30 @@ are performed on the data.
 
 # Installation
 
-* you need the `get_lonlat` utility, for that you need to have compiled
-libosm2pgsql.a ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#building))
-  - then copy `get_lonlat.cpp` to `osm2pgsql/src/get_lonlat.cpp`
-  - and in the `osm2pgsql/build/` directory, after having run `make` :
-  - `g++ ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp
--I ../contrib/fmt/include/ ../build/src/libosm2pgsql.a -Wall -g -o get_lonlat`
-  - Test: `./get_lonlat /path/to/planet.bin.nodes <<< 3546766428`
-    * Should output `39.188565;49.885284;3546766428` if that node was covered by database import
-* run `python3 -u pgsql2osm.py /path/to/get_lonlat /path/to/planet.bin.nodes [...]`
+### `get_lonlat` utility
 
+* Need to compile
+`libosm2pgsql.a` ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#building))
+* then copy `get_lonlat.cpp` to `osm2pgsql/src/get_lonlat.cpp`
+* and in the `osm2pgsql/build/` directory:
+```
+make
+```
+```
+g++ ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp
+-I ../contrib/fmt/include/ ../build/src/libosm2pgsql.a -Wall -g -o get_lonlat
+```
+* Test: 
+```
+./get_lonlat /path/to/planet.bin.nodes <<< 3546766428
+```
+* Should output `39.188565;49.885284;3546766428` if that node was covered by database import
+
+### Run
+
+```
+python3 -u pgsql2osm.py /path/to/get_lonlat /path/to/planet.bin.nodes [...]
+```
 
 _Note_ : the `-u` option enables python unbuffered I/O, for the live progress
 reports as percentages
@@ -164,6 +184,7 @@ reports as percentages
 # Python usage
 
 Also useable without the CLI, from another python script. Example:
+
 ```
 #when pgsql2osm is a subdirectory
 import pgsql2osm.pgsql2osm as pgsql2osm
@@ -217,18 +238,19 @@ as roles `outer` and `inner` boundaries respectively
 
 To generate `regions.csv`, run in a planet database:
 
-
-`psql -d gis -p 5432 --csv -c "select -osm_id as osm_id,coalesce(tags->'name:en',name) as name,
+```
+psql -d gis -p 5432 --csv -c "select -osm_id as osm_id,coalesce(tags->'name:en',name) as name,
     tags->'ISO3166-1' as iso_country,tags->'border_type' as border_type,
     tags->'ISO3166-2' as iso_subcountry,admin_level,tags->'wikipedia' as wikipedia
   from planet_osm_polygon where osm_id<0 and admin_level in ('1','2','3','4')
-    and boundary='administrative'" > regions.csv`
+    and boundary='administrative'" > regions.csv
+```
 
 
 _Note_ : only `admin_level`<=4 is loaded into `regions.csv`.
 Use a search on [openstreetmap.org](https://www.openstreetmap.org) for smaller regions.
 And then extract the relation id from the url:
-[https://www.openstreetmap.org/relation/\<N\>](https://www.openstreetmap.org/relation/51701)
-eg Switzerland
+<https://www.openstreetmap.org/relation/51701> `51701`,
+eg Switzerland in the link
 
 
