@@ -127,7 +127,7 @@ this is unsorted. If you need a sorted `.osm`, use
 
 
 ```
-osmium sort in.osm.bz2  --output=out.osm.bz2
+osmium sort in.osm.bz2 --output=out.osm.bz2
 ```
 
 
@@ -163,7 +163,7 @@ are performed on the data.
 make
 ```
 ```
-g++ ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp
+g++ ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp \
 -I ../contrib/fmt/include/ ../build/src/libosm2pgsql.a -Wall -g -o get_lonlat
 ```
 * Test: 
