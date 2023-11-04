@@ -180,7 +180,7 @@ def regions_lookup(isocode:str) :
             if r_d[i].find(isocode)>=0 :
                 if r_d[i]==isocode :
                     return r_d[headers.index('name')],r_d[headers.index('osm_id')]
-    print('Error iso boundary not found:',isocode,file=sys.stderr)
+    l.log_start(f'Error iso boundary not found: {isocode}')
     exit(1)
 
 class Settings :
