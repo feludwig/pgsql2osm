@@ -15,15 +15,14 @@ for all entities within given boundaries.
 It attempts to preserve all data attributes from original osm data:
 nodes, ways and relations and all their `osm_id`s, all tags, and
 interreferences (references to the outside of the extract you choose will be broken,
-use `--bbox='-180,-89.99,180,89.99'` to select all available data).
+unless you use `--bbox='-180,-89.99,180,89.99'` to select all available data).
 
 
-The main usecase I have for this is to generate an `.obf` file for the Android
+The main usecase I have for this is to generate an `.obf` file using
+[osm2obf](https://github.com/feludwig/osm2obf)
+for the Android
 [OsmAnd](https://osmand.net/)
-app, chained with
-[`OsmAndMapCreator`](https://wiki.openstreetmap.org/wiki/OsmAndMapCreator)
-([guide](https://github.com/osmandapp/web/blob/main/main/docs/technical/map-creation/create-offline-maps-yourself.md))
-for `.osm` -> `.obf`.
+app offline maps.
 
 ## Requirements
 
@@ -34,41 +33,51 @@ for `.osm` -> `.obf`.
 #### Database
 
 * was imported with `osm2pgsql`
-* in `--slim` mode (this allows incremental updates and is also leveraged by `pgsql2osm.py`)
-* _Recommended_ : with `--hstore` containing all remaining tags
-not saved as columns in the `tags::hstore`
-* The geometry table names end with `_point`, `_line`, `_polygon`
-and have a nonzero `srid` for their respective geometry column
-(these are `osm2pgsql` default settings),
-and are the biggest in the database by used space with those suffixes
-(if you happen to have a `smaller_extract_point` table or view).
-To check, see that those tables are present in the result of the following:
-
-
-`SELECT f_table_name,f_geometry_column,srid FROM geometry_columns WHERE srid!=0;`
-
-* with `--flat-nodes`, and access to the `--flat-nodes <FILE>` cache binary file
+    - in `--slim` mode (this allows incremental updates and is also leveraged by `pgsql2osm.py`)
+    - _Recommended_ : with `--hstore` containing all remaining tags
+not saved as columns in the `tags::hstore`. If not, the produced `.osm` will
+have incomplete tags (but will be geometrically sound)
+    - with `--flat-nodes`, and access to the `--flat-nodes <FILE>` cache binary file
 (for now, must be readwrite)
+
+* The geometry tables are the first with names that end
+in `_point`, `_line`, `_polygon` listed in the following query:
+```
+SELECT f_table_name,f_geometry_column,srid,pg_size_pretty(pg_table_size(f_table_name::text))
+FROM geometry_columns WHERE srid!=0 ORDER BY pg_table_size(f_table_name::text) DESC LIMIT 10;
+```
+* Same for `_ways` and `_rels` tables:
+```
+SELECT relname,relkind,pg_size_pretty(pg_table_size(relname::text)),
+    (SELECT nspname FROM pg_namespace WHERE oid=relnamespace) AS namespace
+FROM pg_class WHERE relkind IN ('r','m','v') AND relnamespace NOT IN (SELECT oid FROM pg_namespace
+        WHERE nspname IN ('pg_toast','pg_catalog','information_schema'))
+    AND (relname~'_rels' OR relname~'_ways')
+ORDER BY pg_table_size(relname::text) DESC;
+```
 
 
 ## Features
 
 * XML streaming output, allows to only store compressed .osm.bz2 on disk and not waste RAM.
 Example:
-
-
-`python3 -u pgsql2osm.py --dsn 'dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2`
+```
+python3 pgsql2osm.py --dsn 'dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2
+```
 * Attempt to lower RAM footprint with generators for database queries:
 streaming all the way from database to XML
 * Automatic detection of table names, referred to here as `planet_osm_*` , but they can also
 be named anything with the correct suffixes added by `osm2pgsql`: `_point`, `_line`, `_polygon`,
 `_ways` and `_rels`
 * Automatic detection of the middle database format (legacy text[] or new jsonb,
-available in databases created by `osm2pgsql`>=1.9)
+available in databases created by `osm2pgsql`>=1.9). WARNING: very old versions <1.3 may use a
+different middle database format, it was undocumented at that time. In that case it is recommended to
+re-import with a new `osm2pgsql` version.
 * Automatic detection of `planet_osm_point`, `planet_osm_line` and
 `planet_osm_polygon` columns: a specific `.style` at import is not required
   - _Warning_ : The column names you choose will be the keys in the `.osm` output
-regardless of the original tag's key.
+regardless of the original tag's key. When not using default tag transforms, a `.osm` file will be produced that
+may not have the tags like they are expected by other software.
   - _Note_ : key-values in `tags` override column key-values
 
 * Bounds specifiable as _either_ :
@@ -77,7 +86,7 @@ regardless of the original tag's key.
   - osm relation id `--osm-rel-id N`, for any relation in the database.
   - geojson polygon input file `--geojson file.geojson`
   - bounding box `--bbox='<lon_from>,<lat_from>,<lon_to>,<lat_to>'`
-* Bounds intersection can be specified as one non-`bbox` of the above and a `--bbox`.
+* Bounds intersection can also be specified as one non-`bbox` of the above and a `--bbox`.
 The extracted region will then be the intersection (logical AND) of the shape with the bbox.
 * Anti-Feature: unsorted ids, see [Unsorted ids](#unsorted-ids)
 
@@ -131,39 +140,27 @@ osmium sort in.osm.bz2 --output=out.osm.bz2
 ```
 
 
-### Output may change
-This is experimental, data output may change to work better with other `.osm`-accepting tools.
+### Database does not store all osm data strictly
 
-
-### Errors
-Currently, uncompressed `.osm` output files bigger than about a gigabyte error out
-when used by `OsmAndMapCreator`.
-
-### Unreliable output
-
-The output data may have some missing attributes, because the database import
+The output data may have some missing tags, because the database import
 is not a lossless operation: importing a `.osm.pbf` to database, then exporting
-it to `.osm` and then converting it back to `.osm.pbf` will produce a **different** file.
+it to `.osm` and then converting it back to `.osm.pbf` will most probably
+(on real world data) produce a **different** file.
 
-
-The data from the database is straightforwardly reinterpreted to mean key=value
-osm tags. This is not strictly the case, for example the cycleway and bicycle
-tags. Currently no back-transformations, to compensate for import-time lua transforms,
-are performed on the data.
 
 # Installation
 
 ### `get_lonlat` utility
 
 * Need to compile
-`libosm2pgsql.a` ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#building))
+`osm2pgsql` ([instructions](https://github.com/osm2pgsql-dev/osm2pgsql#building))
 * then copy `get_lonlat.cpp` to `osm2pgsql/src/get_lonlat.cpp`
 * and in the `osm2pgsql/build/` directory:
 ```
 make
 ```
 ```
-g++ ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp \
+g++ -std=c++17 ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp \
 -I ../contrib/fmt/include/ ../build/src/libosm2pgsql.a -Wall -g -o get_lonlat
 ```
 * Test: 
@@ -175,11 +172,9 @@ g++ ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp \
 ### Run
 
 ```
-python3 -u pgsql2osm.py /path/to/get_lonlat /path/to/planet.bin.nodes [...]
+python3 pgsql2osm.py /path/to/get_lonlat /path/to/planet.bin.nodes --help
 ```
-
-_Note_ : the `-u` option enables python unbuffered I/O, for the live progress
-reports as percentages
+For an overview of options
 
 # Python usage
 
@@ -204,7 +199,7 @@ __Note__: will still print progress reports to stderr
 
 ### Database details
 
-* `osm2pgsql`'s `--slim` mode means: has the "middle" layout tables containing all the osm references between
+* `osm2pgsql`'s `--slim` mode means: has the "middle" layout tables containing all the raw osm references between
 `ways->nodes` and `rels->nodes,ways,rels`, more specifically:
 * The "middle" database tables have names ending in `_ways` and `_rels`
 (`osm2pgsql` defaults),
@@ -251,6 +246,5 @@ _Note_ : only `admin_level`<=4 is loaded into `regions.csv`.
 Use a search on [openstreetmap.org](https://www.openstreetmap.org) for smaller regions.
 And then extract the relation id from the url:
 <https://www.openstreetmap.org/relation/51701> `51701`,
-eg Switzerland in the link
-
+eg Switzerland
 

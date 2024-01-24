@@ -11,16 +11,30 @@ import asyncio
 import sys
 import argparse
 
-##TODO
+VERSION='1.0'
 
-# - add rate measaurement, group log and percent messages to logger class.
-#   -> add number repr with K, M and G
-#   -> adaptive to prevent stdout slowdown: only print every 0.1s, only take time
-#      every <count> loops, where count adapts to target every 0.05s only
-#       x / total nodes (r{K}/s) p %
-#       or a nodes, b ways children from x / total rels (r{K}/s) p %
-#       and then the displayed rate is average only over last ~10s of samples
-#   -> add "print_summary_last_line" for showing the 100%...
+"""
+FUTURE IMPROVEMENTS
+    add support WITHOUT planet_bin_nodes... try a test database port 5433 for that
+        -> generate fantasy nodes out of geometries? (fantasy IDs I mean, latlon from
+            ST_Dump(ST_Transform(way,4326)).points...)
+        -> out of xml-order generation!? first ways, rels and then "create" all missing tagless nodes
+        -> would need even more RAM
+    rewrite in C++, haha but would atleast be more RAM-efficient... also xml library can do by hand (CDATA[[]])
+"""
+
+def n(i:int)->str :
+    """ Format big numbers for easier readability
+    """
+    if i<1e3 :
+        return str(i)
+    elif i<1e6 :
+        return f'{round(i/1e3,3):.3f}K'
+    elif i<1e9 :
+        return f'{round(i/1e6,6):.6f}M'
+    elif i<1e12 :
+        return f'{round(i/1e9,9):.9f}G'
+    return f'{round(i/1e12,12):.12f}T'
 
 class Accumulator() :
 
@@ -200,6 +214,7 @@ class Settings :
         
         self.access=psycopg2.connect(args.postgres_dsn)
 
+        self.has_suggested_out_filename=False #only print suggestion once
         self.connect_and_check()
 
     def connect_and_check(self) :
@@ -251,7 +266,6 @@ class Settings :
 
         l.log_start('INFO: detected middle database layout = '+('new jsonb' if self.new_jsonb_schema else 'legacy text[]'))
         asyncio.run(self.test())
-        self.has_suggested_out_filename=False #only print suggestion once
 
 
     def make_bounds_constr(self,table_key:str)->typing.Collection[str] :
@@ -285,11 +299,11 @@ class Settings :
             from_rel_id=True
 
         if from_rel_id :
-            #relation ids are stored negative
             relbound_way_col=self.tables['_polygon']['geom']
             relbound_name=self.tables['_polygon']['name'] #stores negative osm_ids for relations
             assert tgt_srid==self.tables['_polygon']['srid'], 'Unsupported cross-table different geometry SRIDs'
-            way_constr=f'(SELECT relbound.way FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
+            #relation ids are stored negative
+            way_constr=f'(SELECT relbound.{relbound_way_col} FROM {relbound_name} AS relbound WHERE osm_id={-osm_rel_id})'
             way_constr=f'ST_Intersects({way_column},{way_constr})'
         
         if self.bounds_box!=None and way_constr==None :
@@ -316,7 +330,6 @@ class Settings :
         """ Handle all the asyncio stuff for stream_osm_xml(), only returns when
         everything is finished. Can be run multiple times
         """
-        self.has_suggested_out_filename=False
         try :
             t=asyncio.run(stream_osm_xml(self))
         except ZeroDivisionError :
@@ -340,11 +353,11 @@ class ModuleSettings(Settings) :
     settings value, this script may crash just before the end!
     """
     def __init__(self,**kwargs):
-        #something not in keys will be ignored, dict value is default value
+        #something not in keys will be ignored, dict value is DEFAULT value
         keys={'debug':False,'debug_xml':False,'bounds_geojson':None,
                 'bounds_rel_id':None,'bounds_iso':None,'bounds_box':None,
                 'get_lonlat_binary':None,'nodes_file':None,'out_file':None,
-                'access':None,'postgres_dsn':None,
+                'access':None,'postgres_dsn':None,'has_suggested_out_filename':False,
         }
         for k,v in kwargs.items() :
             if k in keys :
@@ -359,6 +372,10 @@ class Logger() :
         self._ready=False
         self.previous_prependline=False
         self.previous_clearline=None
+        #os.get_terminal_size() will error out when .isatty() is false.
+        # instead of calling isatty() on each line, save it one at program start
+        # (because it does not change)
+        self.isatty=sys.stderr.isatty()
 
     def check_ready(self) :
         assert self._ready, 'Need to run .set_phases first'
@@ -400,33 +417,187 @@ class Logger() :
         # a clearline will trigger clearing the line EXCEPT when the previous log was a prependline
         # -- OR --
         # two prependlines after eachother will trigger clearing the line: the newer erases the older
+        should_flush=False
         if ((prependline or clearline) and not self.previous_prependline) or (self.previous_prependline and prependline):
-            print(end='\033[2K\r',file=sys.stderr)
+            should_flush=True
+            print(end='\r',file=sys.stderr)
         if not (clearline or prependline) and self.previous_clearline :
+            should_flush=True
             print(file=sys.stderr) #reset clearline
         #a bit crazy syntax, but I want the field length to be variably dependent on self.str_maxlen_phase
         if not self.previous_prependline :
             # f-string will make -> '{:<13}'
             # str.format will do -> 'one          '
             str_msg=f'[ {{:<{l}}}] {{}}'.format(phase,str_msg)
+        # \033[2K erasing the line makes a flicker, this should not
+        # by just printing over with spaces, until end of terminal. it WILL get meesed up if you
+        # resize the terminal while it's printing a progress...
+        str_msg+=' '*((os.get_terminal_size().columns if self.isatty else 80)-len(str_msg))
         print(str_msg,end=('' if clearline else ' ' if prependline else '\n'),file=sys.stderr)
         self.previous_prependline=prependline
         self.previous_clearline=clearline
+        if should_flush :
+            sys.stderr.flush()
 
     def log_start(self,str_msg) :
         print('[ start ]',str_msg,file=sys.stderr)
 
-def percent(numer:int,denom:int)->str :
-    ''' Return the str(float(numer/denom)*100) with 3 sigfigs,
-    '''
-    r=numer/denom*100
-    # ljust for 3.0 -> 3.00
-    if r<1.0 :
-        return str(round(r,3)).ljust(5,'0')+'%'
-    elif r<10.0 :
-        return str(round(r,2)).ljust(4,'0')+'%'
-    else :
-        return str(round(r,1)).ljust(3,'0')+'%'
+class RateLogger(Logger) :
+    """ Subclass of Logger because it reuses its .log() and various functions.
+    Also a drop-in replacement to Logger but with additional .rate()
+    Usage: normal like Logger, but 4 rate functions available: simplerate, rate, doublerate and
+    triplerate. Calling one of those functions at every loop iteration with progress
+    numbers will then print a progress bar with a custom message, and a rate (e.g 4.6M/s) of processed
+    items.
+    * NOTE: Need to call self.finishrate() at the end of the loop, to allow for other rate progress
+    bars to be printed.
+    * NOTE: calling self.log during a rate loop is also supported.
+    """
+    def __init__(self) :
+        super().__init__()
+        self.samples=[]
+        self.times=[]
+        self.sample_length=10_000
+        self.min_time_interval_s=0.05
+        self.prev_print_t=0
+        self.prev_args=[]
+
+    def check(self)->bool :
+        """ Only calculate and print to console at time-distanced intervals.
+        This is both because printing a lot will stress the stdout buffer (wasting CPU)
+        and produce multiple megabytes of (useless) text output if piped to a file.
+        Also calculating the average is not needed at every call of one of the rate functions.
+        Use self.min_time_interval_s (50ms) as the minimal time between two calculate_avg+print
+        steps.
+        """
+        t=time.time()
+        if (t-self.prev_print_t)>self.min_time_interval_s :
+            self.prev_print_t=t
+            return True
+        return False
+
+    def samples_append(self,n:tuple) :
+        """ The data in n is intended for a rate measurement: so also keep self.times
+        updated. To prevent wasting memory, calculate a rolling average over the last
+        self.sample_length (10'000) samples only. A total average would also be possible
+        (and only require storing 1 value) but less expressive of "live"
+        changes (Start some cpu-heavy background job-> the rate falls).
+        """
+        if len(self.samples)>=self.sample_length :
+            self.samples.pop(0)
+            self.times.pop(0)
+        self.samples.append(n)
+        self.times.append(time.time())
+
+    def ratefmt(self,r:float) :
+        ''' Return str(r) with 3 sigfigs
+        '''
+        for i,letter in ((1e12,'T'),(1e9,'G'),(1e6,'M'),(1e3,'K'),(1,'')) :
+            if r>i :
+                tgt=r/i
+                # ljust for 3 -> 3.00
+                if tgt<10.0 :
+                    return str(round(tgt,2)).ljust(4,'0')+letter
+                elif tgt<100.0 :
+                    return str(round(tgt,1)).ljust(4,'0')+letter
+                else :
+                    return str(round(tgt)).ljust(3,'0')+letter
+        #else give up
+        return n(r)
+    
+    def simplerate(self,count:int,msg:str,tot:int,lastline=False) :
+        """ Show a rate progress bar on count from tot items in format:
+            '{count} ({count_rate}/s) / {tot} {msg}    {percent:count/tot}%'
+        """
+        self.is_simplerate=True
+        if not lastline :
+            self.samples_append((count,))
+        self.prev_args=(count,msg,tot)
+        if self.check() or lastline :
+            t_diff=self.times[-1]-self.times[0]
+            if t_diff>1e-5 :
+                #calculate avg
+                r_a=(self.samples[-1][0]-self.samples[0][0])/t_diff
+                r_s_a='('+self.ratefmt(r_a)+'/s)'
+            else :
+                r_s_a='(0/s)'
+            l=(n(count),r_s_a+' / '+n(tot),msg,'   ',self.percent(count,tot),)
+            self.log(*l,clearline=True)
+
+    def rate(self,a:int,msg:str,count:int,total:int) :
+        """ Show a rate progress bar on a for items from count to tot in format:
+            '{a} ({a_rate}/s) {msg} {count} / {tot}   {percent:count/tot}%'
+            This is useful when processing item count from total, producing a variable
+            amount of sub-items, of which that other total is a (and total_a is unknowable)
+        """
+        self.multirate((a,),(msg,),count,total)
+
+    def triplerate(self,a:int,a_msg:str,b:int,b_msg:str,c:int,c_msg:str,count:int,total:int) :
+        """ Like .rate() ,show a rate progress bar on a for items from count to tot in format:
+        But use three counts: a, b and c
+            '{a} ({a_rate}/s) {a_msg} {b} ({b_rate}/s) {b_msg} {c} {c_rate/s} {c_msg} {count} / {tot}   {percent:count/tot}%'
+        """
+        self.multirate((a,b,c,),(a_msg,b_msg,c_msg,),count,total)
+
+    def doublerate(self,a:int,a_msg:str,b:int,b_msg:str,count:int,total:int) :
+        """ Like .rate() ,show a rate progress bar on a for items from count to tot in format:
+        But use two counts: a and b
+            '{a} ({a_rate}/s) {a_msg} {b} ({b_rate}/s) {b_msg} {count} / {tot}   {percent:count/tot}%'
+        """
+        self.multirate((a,b,),(a_msg,b_msg,),count,total)
+
+    def multirate(self,ns:typing.Tuple[int],msgs:typing.Tuple[str],count:int,total:int,lastline=False) :
+        """ Generalized version of .rate(), .doublerate() and .triplerate(). Those functions just
+        reshuffle the arguments so that calling them has the args arranged in an order similar to
+        how they will be printed out. Not .simplerate() though, it is separate.
+        """
+        self.is_simplerate=False
+        if not lastline :
+            self.samples_append(ns)
+        self.prev_args=(ns,msgs,count,total)
+        if self.check() or lastline:
+            t_diff=self.times[-1]-self.times[0]
+            if t_diff>1e-5 :
+                #calculate avg
+                rs=[(self.samples[-1][ix]-self.samples[0][ix])/t_diff for ix,_ in enumerate(ns)]
+                r_ss=['('+self.ratefmt(rs[ix])+'/s)' for ix,_ in enumerate(ns)]
+            else :
+                r_ss=['(0/s)' for ix in enumerate(ns)]
+            rates=[j for ix,i in enumerate(ns) for j in (n(i),r_ss[ix],msgs[ix])]
+            l=(*rates,n(count)+' / '+n(total),'   ',self.percent(count,total),)
+            if lastline :
+                self.log(*l,clearline=True)
+            else :
+                self.log(*l,clearline=True)
+
+    def finishrate(self,lastline=True) :
+        """ Any currently running rate printer (simplerate,rate,doublerate,triplerate)
+        has finished (for loop has ended) : reset counters and data storage.
+        When lastline=False, do NOT calculate+print the final "summary 100%" line
+        """
+        if lastline :
+            #last line print
+            if self.is_simplerate :
+                self.simplerate(*self.prev_args,lastline=True)
+            else :
+                self.multirate(*self.prev_args,lastline=True)
+        #reset rate measurement
+        self.samples=[]
+        self.times=[]
+        self.prev_print_t=0
+        self.prev_args=None
+
+    def percent(self,numer:int,denom:int)->str :
+        ''' Return the str(float(numer/denom)*100) with 3 sigfigs,
+        '''
+        r=numer/denom*100
+        # ljust for 3.0 -> 3.00
+        if r<1.0 :
+            return str(round(r,3)).ljust(5,'0')+'%'
+        elif r<10.0 :
+            return str(round(r,2)).ljust(4,'0')+'%'
+        else :
+            return str(round(r,1)).ljust(3,'0')+'%'
 
 async def chain(*generators:typing.Iterator)->typing.Iterator:
     for g in generators :
@@ -501,7 +672,8 @@ def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
     # 2b) select all ways WHERE ARRAY[node_id]::bigint[] <@ nodes;
     # 2c) select all rels WHERE ARRAY[node_id]::bigint[] <@ parts;
     nodes_name='nodes_within' if only_nodes_within else 'nodes'
-    l.log('checking parent ways of',a.len(nodes_name),'nodes')
+    a_len=a.len
+    l.log('checking parent ways of',a_len(nodes_name),'nodes')
     way_count=0
     rel_count=0
     node_count=0
@@ -535,17 +707,15 @@ def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
                 rels_query),
             [(lambda i:','.join(map(str,i)),),rels_lambdas]) :
         node_count+=node_c
-        if node_count%8==0 :
-            l.log(way_count,'ways,',rel_count,
-                'rels parents of node',node_count,'/',a.len(nodes_name),
-                '    ',percent(node_count,a.len(nodes_name)),clearline=True)
+        l.doublerate(way_count,'ways',rel_count,'rels parents of node',node_count,a_len(nodes_name))
         for way in way_ids:
             way_count+=1
             a.add('ways',way['id'])
         for rel in rel_ids:
             rel_count+=1
             a.add('rels',rel['id'])
-    l.log(a.len('ways'),'ways,',a.len('rels'),'rels forward from nodes')
+    l.finishrate(lastline=False)
+    l.log(n(a_len('ways')),'ways,',n(a_len('rels')),'rels forward from nodes')
 
 def ways_parent_r(s:Settings,a:Accumulator) :
     # 3a) foreach way_id :
@@ -553,6 +723,7 @@ def ways_parent_r(s:Settings,a:Accumulator) :
     way_count=0
     rel_count=0
     tbl_rels=s.tables['_rels']['name']
+    a_len=a.len
     if s.new_jsonb_schema :
         # the ::char(1) cast IS IMPORTANT for index performance, 10x or more slower without it
         rels_query="SELECT id FROM "+tbl_rels
@@ -571,10 +742,9 @@ def ways_parent_r(s:Settings,a:Accumulator) :
         for rel in rel_ids:
             rel_count+=1
             a.add('rels',rel['id'])
-        if way_count%8==0 :
-            l.log(rel_count,'rels parents of way',way_count,'/',a.len('ways'),
-                '    ',percent(way_count,a.len('ways')),clearline=True)
-    l.log(a.len('rels'),'rels forward')
+        l.rate(rel_count,'rels parents of way',way_count,a_len('ways'))
+    l.finishrate(lastline=False)
+    l.log(a_len('rels'),'rels forward')
 
 def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,without_rels=False) :
     ''' Going over all rel ids in accumulator, read every rel's members[] array and add all its
@@ -588,6 +758,7 @@ def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,with
     way_count=0
     rel_count=0
     tot_count=0
+    a_len=a.len
     #relation can be of very different types. a multipolygon could be a forest for example,
     # with an associated geometry. constrast that to a type="route" or type="superroute",
     # thore are only groups of already representable ways on the map
@@ -641,15 +812,16 @@ def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,with
                             raise ValueError(f'''Encountered invalid members[]
                                 element of rel id {rel_id} in members={repr(ms)}
                                 at index [{i}]={repr(ms[i])}''')
-            l.log(node_count,'nodes,',way_count,'ways,',rel_count,'rels children of rel',tot_count,'/',
-                a.len('rels'),'    ',percent(tot_count,a.len('rels')),clearline=True)
+            l.triplerate(node_count,'nodes',way_count,'ways',rel_count,'rels children of rel',
+                    tot_count,a_len('rels'))
         if without_rels :
-            l.save_clearedline()
+            #l.save_clearedline()
+            l.finishrate()
             return #after first run
         for rel_id in buffer_add_rels :
             a.add('rels',rel_id)
         tot_count=0 #reset counter to make only count up to 100% not 200%
-    l.save_clearedline()
+    l.finishrate()
 
 def ways_children_n(s:Settings,a:Accumulator) :
     a_len=a.len
@@ -666,13 +838,8 @@ def ways_children_n(s:Settings,a:Accumulator) :
                     l.log('n122317 is in',a.is_in('nodes',122317))
                     l.log('FROM way',row['id'],'which has',len(row['nodes']),'nodes')
                 node_count+=1
-        if way_count%32==0 :
-            l.log(node_count,'nodes children of way',way_count,'/',a_len('ways'),
-                '    ',percent(way_count,a_len('ways')),clearline=True)
-    #end write line with 100%
-    l.log(node_count,'nodes children of way',way_count,'/',a_len('ways'),
-        '    ',percent(way_count,a_len('ways')),clearline=True)
-    l.save_clearedline()
+        l.rate(node_count,'nodes children of way',way_count,a_len('ways'))
+    l.finishrate()
 
 
 async def stream_osm_xml(s:Settings) :
@@ -728,8 +895,9 @@ async def stream_osm_xml(s:Settings) :
     with ET.xmlfile(out_file,encoding='utf-8') as xml_out :
         xml_out.write_declaration()
         with xml_out.element('osm',{
-                'version':'0.6',
-                'generator':time.strftime('https://github.com/feludwig/pgsql2osm/pgsql2osm.py %F')
+            'version':'0.6',
+            'generator':time.strftime(f'pgsql2osm.py v{VERSION} %F'),
+            'url':'https://github.com/feludwig/pgsql2osm/pgsql2osm.py',
         }) :
             async for el in chain(
                     create_nodes(s,a),
@@ -782,7 +950,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     len_ids=a_len('rels')
 
     table_name=s.tables['_polygon']['name']
-    l.log(a_len('done_ids'),'/',len_ids,'rels, reading table',table_name,'...')
+    l.log('reading table',table_name,'...')
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         # we need to merge the _polygon tags with the _rels tags.
@@ -819,11 +987,14 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'done_ids_len':str(a_len('done_ids')),'ids_len':str(len_ids),
                 'table':table_name})
         add_done_ids(row_dict['id'])
-        l.log(a_len('done_ids'),'/',len_ids,'rels','    ',percent(a_len('done_ids'),len_ids),clearline=True)
+        l.simplerate(a_len('done_ids'),'rels',len_ids)
+        #l.log(n(a_len('done_ids')),'/',n(len_ids),'rels','    ',
+        #        percent(a_len('done_ids'),len_ids),clearline=True)
+    l.finishrate()
 
     #and now with _line as well
     table_name=s.tables['_line']['name']
-    l.log(a_len('done_ids'),'/',len_ids,'rels, reading table',table_name,'...')
+    l.log('reading table',table_name,'...')
 
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
@@ -889,14 +1060,14 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'done_ids_len':str(a_len('done_ids')),'ids_len':str(len_ids),
                 'table':table_name})
         add_done_ids(row_dict['id'])
-        l.log(a_len('done_ids'),'/',len_ids,'rels','    ',percent(a_len('done_ids'),len_ids),clearline=True)
+        l.simplerate(a_len('done_ids'),'rels',len_ids)
     if first :
         #edgecase when query returned 0 items
         start_t=time.time()
     l.log('rels _line output end',(time.time()-start_t))
 
     table_name=tbl_rels
-    l.log(a_len('done_ids'),'/',len_ids,'rels, reading table',table_name,'...')
+    l.log('reading table',table_name,'...')
     if s.new_jsonb_schema :
         query=f'SELECT id,members,tags AS json_tags FROM {table_name}'
     else :
@@ -917,10 +1088,8 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'done_ids_len':str(a_len('done_ids')),'ids_len':str(len_ids),
                 'table':table_name})
         add_done_ids(row_dict['id'])
-        l.log(a_len('done_ids'),'/',len_ids,'rels','    ',
-                percent(a_len('done_ids'),len_ids),clearline=True)
-    l.log(a_len('done_ids'),'/',len_ids,'rels','    ',
-            percent(a_len('done_ids'),len_ids),clearline=True)
+        l.simplerate(a_len('done_ids'),'rels',len_ids)
+    l.finishrate()
     a.clear('rels')
 
 def way_to_xml(row_dict:dict,tags:dict)->ET.Element :
@@ -949,7 +1118,7 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     a.clear('done_ids')
     len_ids=a_len('ways')
 
-    l.log(a_len('done_ids'),'/',len_ids,'ways, reading table',table_name,'...')
+    l.log('reading table',table_name,'...')
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags', #polygons stores a hstore even in the new_jsonb_schema
         f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
@@ -970,11 +1139,11 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
         yield way_to_xml(row_dict,tags)
         add_done_ids(row_dict['id'])
-        l.log(a_len('done_ids'),'/',len_ids,'ways','    ',percent(a_len('done_ids'),len_ids),clearline=True)
+        l.simplerate(a_len('done_ids'),'ways',len_ids)
 
     #and now with _line
     table_name=s.tables['_line']['name']
-    l.log(a_len('done_ids'),'/',len_ids,'ways, reading table',table_name,'...')
+    l.log('reading table',table_name,'...')
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
@@ -992,12 +1161,11 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
         yield way_to_xml(row_dict,tags)
         add_done_ids(row_dict['id'])
-        l.log(a_len('done_ids'),'/',len_ids,'ways','    ',percent(a_len('done_ids'),len_ids),clearline=True)
-
+        l.simplerate(a_len('done_ids'),'ways',len_ids)
 
     #everything else was queried, only _ways remains
     table_name=tbl_ways
-    l.log(a_len('done_ids'),'/',len_ids,'ways, reading table',table_name,'...')
+    l.log('reading table',table_name,'...')
     #in this table, tags::text[], not yet a hstore
     if s.new_jsonb_schema :
         query=f'SELECT id,nodes,tags AS json_tags FROM {table_name}'
@@ -1010,7 +1178,8 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
         yield way_to_xml(row_dict,tags)
         add_done_ids(row_dict['id'])
-        l.log(a_len('done_ids'),'/',len_ids,'ways','    ',percent(a_len('done_ids'),len_ids),clearline=True)
+        l.simplerate(a_len('done_ids'),'ways',len_ids)
+    l.finishrate()
     a.clear('ways')
 
 def g_negate(g:typing.Iterator[int]) :
@@ -1024,13 +1193,14 @@ def g_from_cursor(c:psycopg2.extensions.cursor,verbose=False,prefix_msg='')->typ
     tot_count=c.rowcount
     count=1 # for human display
     while (row:=c.fetchone())!=None :
-        if verbose and count%32==0:
-            l.log(prefix_msg+'row',count,'/',tot_count,'    ',percent(count,tot_count),clearline=True)
+        if verbose :
+            l.simplerate(count,prefix_msg+'row',tot_count)
         yield {k:v for k,v in zip(columns,row) if v!=None}
         count+=1
     if verbose:
-        count-=1
-        l.log(prefix_msg+'row',count,'/',tot_count,'    ',percent(count,tot_count),clearline=True)
+        l.finishrate()
+        #count-=1
+        #l.log(prefix_msg+'row',n(count),'/',n(tot_count),'    ',percent(count,tot_count),clearline=True)
 
 def g_query_ids(c:psycopg2.extensions.cursor,query:str,ids:typing.Iterator[int],
         id_col:str,step=1000,verbose=False)->typing.Iterator[dict] :
@@ -1123,7 +1293,7 @@ async def create_nodes(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     add_done_ids=lambda i:a_add('done_ids',i)
     len_ids=a_len('nodes')
 
-    l.log(a_len('done_ids'),'/',len_ids,'nodes, reading table',table_name,'...',clearline=True)
+    l.log('reading table',table_name,'...',clearline=True)
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         f'ST_X(ST_Transform({table_name}.way,4326)) AS lon',
@@ -1143,9 +1313,8 @@ async def create_nodes(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         row_add={k:str(round(row_dict[k],10)) for k in ('lat','lon')}
         yield node_to_xml({**row_dict,**row_add},tags)
         add_done_ids(row_dict['id'])
-        if a_len('done_ids')%32==0 :
-            l.log(a_len('done_ids'),'/',len_ids,'nodes','    ',
-                percent(a_len('done_ids'),len_ids),clearline=True)
+        l.simplerate(a_len('done_ids'),'nodes',len_ids)
+    l.finishrate()
     l.log('now querying flatnodes file for missing nodes')
     to_get_lat_lons=set()
 
@@ -1157,12 +1326,9 @@ async def create_nodes(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 continue
             yield node_to_xml({'id':osm_id,'lat':lat,'lon':lon},{})
             add_done_ids(osm_id_int)
-            if a_len('done_ids')%16==0 :
-                l.log(a_len('done_ids'),'/',len_ids,'nodes','    ',
-                    percent(a_len('done_ids'),len_ids),clearline=True)
+            l.simplerate(a_len('done_ids'),'nodes',len_ids)
+    l.finishrate()
     a.clear('nodes')
-    l.log(a_len('done_ids'),'/',len_ids,'nodes','    ',
-        percent(a_len('done_ids'),len_ids),clearline=True)
 
 def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Collection] :
     ''' Return sets of items yielded by generator of length at
@@ -1179,7 +1345,7 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
         yield current_batch
 
 
-l=Logger() #global variable
+l=RateLogger() #global variable
 
 if __name__=='__main__' :
     parser=argparse.ArgumentParser(prog='pgsql2osm')
@@ -1189,22 +1355,23 @@ if __name__=='__main__' :
     parser.add_argument('nodes_file',
         help='Path to the nodes file created by osm2pgsql at import')
     parser.add_argument('-d','--dsn',dest='postgres_dsn',
-        default='dbname=gis',
-        help="The connection string to pass to psycopg2 eg 'host=localhost dbname=gis port=5432'")
+        default='dbname=gis port=5432',
+        help="The connection string to pass to psycopg2, default '%(default)s'")
 
-    #one of the following:
     parser.add_argument('-b','--bbox',dest='bounds_box',
         default=None,type=str,
         help='''Rectangle boundary in the format lon_from,lat_from,lon_to,lat_to.
 Can be specified in addition to other boundaries, and will then extract the intersection.
 Info: use quotes with negative numbers, eg --bbox='-180,-89,180,89'.''')
-    parser.add_argument('-r','--osm-rel-id',dest='bounds_rel_id',
+    #one of the following:
+    bounds_g=parser.add_mutually_exclusive_group(required=True)
+    bounds_g.add_argument('-r','--osm-rel-id',dest='bounds_rel_id',
         default=None,type=int,
         help='Integer for the osm relation that should make the boundary')
-    parser.add_argument('-i','--iso',dest='bounds_iso',
+    bounds_g.add_argument('-i','--iso',dest='bounds_iso',
         default=None,
         help='Country or region code for looking up in regions.csv, to determine boundary')
-    parser.add_argument('-g','--geojson',dest='bounds_geojson',
+    bounds_g.add_argument('-g','--geojson',dest='bounds_geojson',
         default=None,
         help='Geojson file for determining the boundary')
 
