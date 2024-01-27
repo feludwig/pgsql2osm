@@ -334,6 +334,7 @@ class Settings :
             t=asyncio.run(stream_osm_xml(self))
         except ZeroDivisionError :
             print('\nError: boundary is empty or database has no data within',file=sys.stderr)
+        sys.stderr.flush()
 
     async def test(self) :
         """ Test: checks if get_lonlat exsits, is executable.
@@ -375,7 +376,11 @@ class Logger() :
         #os.get_terminal_size() will error out when .isatty() is false.
         # instead of calling isatty() on each line, save it one at program start
         # (because it does not change)
-        self.isatty=sys.stderr.isatty()
+        try :
+            #sys.stderr.isatty() seems to return True when <prog>|tail -f /dev/stdin
+            self.isatty=os.get_terminal_size().columns>0
+        except OSError :
+            self.isatty=False
 
     def check_ready(self) :
         assert self._ready, 'Need to run .set_phases first'
@@ -394,9 +399,10 @@ class Logger() :
 
     def save_clearedline(self) :
         ''' Simply write a newline at the end of the previous clearline: save it.
-        Warning, will garbe output if not preceded by a clearline=True log call.
+        Warning, will garble output if not preceded by a clearline=True log call.
         '''
         print(end='\n',file=sys.stderr)
+        sys.stderr.flush()
         #same behaviour whether followed by a clearline or not
         self.previous_clearline=False
 
@@ -493,23 +499,26 @@ class RateLogger(Logger) :
         ''' Return str(r) with 3 sigfigs
         '''
         for i,letter in ((1e12,'T'),(1e9,'G'),(1e6,'M'),(1e3,'K'),(1,'')) :
-            if r>i :
+            if r>i or i==1: #give up at <1.0 point
                 tgt=r/i
                 # ljust for 3 -> 3.00
-                if tgt<10.0 :
+                if tgt<1.0 :
+                    return str(round(tgt,3)).ljust(5,'0')+letter
+                elif tgt<10.0 :
                     return str(round(tgt,2)).ljust(4,'0')+letter
                 elif tgt<100.0 :
                     return str(round(tgt,1)).ljust(4,'0')+letter
                 else :
                     return str(round(tgt)).ljust(3,'0')+letter
-        #else give up
-        return n(r)
     
     def simplerate(self,count:int,msg:str,tot:int,lastline=False) :
         """ Show a rate progress bar on count from tot items in format:
             '{count} ({count_rate}/s) / {tot} {msg}    {percent:count/tot}%'
         """
         self.is_simplerate=True
+        if count>1e6 :
+            #set higher for a smoother rate display
+            self.sample_length=100_000
         if not lastline :
             self.samples_append((count,))
         self.prev_args=(count,msg,tot)
@@ -552,6 +561,8 @@ class RateLogger(Logger) :
         how they will be printed out. Not .simplerate() though, it is separate.
         """
         self.is_simplerate=False
+        if ns[0]>1e6 :
+            self.sample_length=100_000
         if not lastline :
             self.samples_append(ns)
         self.prev_args=(ns,msgs,count,total)
@@ -565,10 +576,7 @@ class RateLogger(Logger) :
                 r_ss=['(0/s)' for ix in enumerate(ns)]
             rates=[j for ix,i in enumerate(ns) for j in (n(i),r_ss[ix],msgs[ix])]
             l=(*rates,n(count)+' / '+n(total),'   ',self.percent(count,total),)
-            if lastline :
-                self.log(*l,clearline=True)
-            else :
-                self.log(*l,clearline=True)
+            self.log(*l,clearline=True)
 
     def finishrate(self,lastline=True) :
         """ Any currently running rate printer (simplerate,rate,doublerate,triplerate)
@@ -581,11 +589,13 @@ class RateLogger(Logger) :
                 self.simplerate(*self.prev_args,lastline=True)
             else :
                 self.multirate(*self.prev_args,lastline=True)
+            self.save_clearedline()
         #reset rate measurement
         self.samples=[]
         self.times=[]
         self.prev_print_t=0
         self.prev_args=None
+        self.sample_length=10_000
 
     def percent(self,numer:int,denom:int)->str :
         ''' Return the str(float(numer/denom)*100) with 3 sigfigs,
@@ -612,7 +622,6 @@ async def chain(*generators:typing.Iterator)->typing.Iterator:
 
 async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
         s:Settings)->typing.Iterator :
-    #beware, need to exchange lonlat -> latlon
     a=await asyncio.create_subprocess_exec(s.get_lonlat_binary,s.nodes_file,
         stdout=asyncio.subprocess.PIPE,stdin=asyncio.subprocess.PIPE)
     # some osm_ids may error out. in that case get_lonlat just ignores them.
@@ -628,6 +637,7 @@ async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
     while (line:=(await a.stdout.readline()).strip().decode()) :
         #l.log('read line',line)
         x,y,osm_id=line.split(';')
+        #beware, need to exchange lonlat -> latlon
         yield (osm_id,y,x)
 
 def all_nwr_within(s:Settings,a:Accumulator) :
@@ -638,7 +648,7 @@ def all_nwr_within(s:Settings,a:Accumulator) :
     s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
     for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         a.add('nodes',row['osm_id'])
-    l.log(a.len('nodes'),'nodes within bounds')
+    l.log(n(a.len('nodes')),'nodes within bounds')
 
     # 1b) select all ways,rels FROM planet_osm_polygon WHERE way ST_Within(bbox);
     constr,tbl_name=s.make_bounds_constr('_polygon')
@@ -650,7 +660,7 @@ def all_nwr_within(s:Settings,a:Accumulator) :
             a.add('ways',id)
         else :
             a.add('rels',-id)
-    l.log(a.len('ways'),'ways,',a.len('rels'),'rels from',tbl_name)
+    l.log(n(a.len('ways')),'ways,',n(a.len('rels')),'rels from',tbl_name)
 
     # 1c) select all ways,rels FROM planet_osm_line WHERE way ST_Within(bbox);
     # planet_osm_roads is not needed in that fashion, because it is a strict subset
@@ -664,16 +674,14 @@ def all_nwr_within(s:Settings,a:Accumulator) :
             a.add('ways',id)
         else :
             a.add('rels',-id)
-    l.log(a.len('ways'),'ways,',a.len('rels'),'rels within bounds')
+    l.log(n(a.len('ways')),'ways,',n(a.len('rels')),'rels within bounds')
 
-    
 def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
     # 2a) foreach node_id :
     # 2b) select all ways WHERE ARRAY[node_id]::bigint[] <@ nodes;
     # 2c) select all rels WHERE ARRAY[node_id]::bigint[] <@ parts;
     nodes_name='nodes_within' if only_nodes_within else 'nodes'
     a_len=a.len
-    l.log('checking parent ways of',a_len(nodes_name),'nodes')
     way_count=0
     rel_count=0
     node_count=0
@@ -714,7 +722,7 @@ def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
         for rel in rel_ids:
             rel_count+=1
             a.add('rels',rel['id'])
-    l.finishrate(lastline=False)
+    l.finishrate()
     l.log(n(a_len('ways')),'ways,',n(a_len('rels')),'rels forward from nodes')
 
 def ways_parent_r(s:Settings,a:Accumulator) :
@@ -885,7 +893,7 @@ async def stream_osm_xml(s:Settings) :
 
     l.next_phase() #write
     counts=[a.len(i)for i in ('nodes','ways','rels')]
-    l.log('dumping',counts[0],'nodes,',counts[1],'ways,',counts[2],'rels in total')
+    l.log('dumping',n(counts[0]),'nodes,',n(counts[1]),'ways,',n(counts[2]),'rels in total')
     # we now have: [~3.3M nodes, ~400K ways, ~8K rels] with_parents=True
 
     # ONLY after all ids have been resolved, do we actually query the data,
@@ -905,7 +913,6 @@ async def stream_osm_xml(s:Settings) :
                     create_relations(s,a),
             ) :
                 xml_out.write(el)
-    print(file=sys.stderr)
 
 def rel_to_xml(row_dict:dict,tags:dict,new_jsonb_schema:bool)->ET.Element :
     # separate tags and row_dict, see way_to_xml()
@@ -1040,7 +1047,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     for row_dict in g_query_ids(s.c,query,g_negate(a.all_subtract('rels','done_ids')),'osm_id',step=250) :
         if first :
             start_t=time.time()
-            l.log('rels _line output start',start_t)
+            #l.log('rels _line output start',start_t)
             first=False
 
         if a.is_in('done_ids',row_dict['id']) :
