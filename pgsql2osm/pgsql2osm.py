@@ -11,7 +11,10 @@ import asyncio
 import sys
 import argparse
 
-VERSION='1.0'
+from . import settings
+from . import dbutils
+from . import log
+from . import __version__
 
 """
 FUTURE IMPROVEMENTS
@@ -22,19 +25,6 @@ FUTURE IMPROVEMENTS
         -> would need even more RAM
     rewrite in C++, haha but would atleast be more RAM-efficient... also xml library can do by hand (CDATA[[]])
 """
-
-def n(i:int)->str :
-    """ Format big numbers for easier readability
-    """
-    if i<1e3 :
-        return str(i)
-    elif i<1e6 :
-        return f'{round(i/1e3,3):.3f}K'
-    elif i<1e9 :
-        return f'{round(i/1e6,6):.6f}M'
-    elif i<1e12 :
-        return f'{round(i/1e9,9):.9f}G'
-    return f'{round(i/1e12,12):.12f}T'
 
 class Accumulator() :
 
@@ -95,7 +85,7 @@ class Accumulator() :
                     q_uery=q.format(*data_s)
                     #l.log(q_uery)
                     c.execute(q_uery)
-                    results[ix]=list(g_from_cursor(c))
+                    results[ix]=list(dbutils.g_from_cursor(c))
                 total_processed_nodes+=len(nodes_chunk)
                 #tentatively highten the chunk size, just to spice things up
                 # (and maybe the db engine has warmed up in the meantime)
@@ -137,11 +127,11 @@ class Accumulator() :
                     chunk_size=1 #well we just need to work with the slow database...
                     if not printed_slow_warning :
                         pid=os.getpid()
-                        l.log('WARNING: queries are running very slowly, the index may not exist.')
-                        l.log(f'\tplease kill this process: "kill {pid}" and create indexes:')
-                        l.log('\tCREATE INDEX planet_osm_ways_nodes_bucket_idx ON planet_osm_ways')
-                        l.log('\t\tUSING GIN (planet_osm_index_bucket(nodes))')
-                        l.log('\t\tWITH (fastupdate = off);')
+                        log.l.log('WARNING: queries are running very slowly, the index may not exist.')
+                        log.l.log(f'\tplease kill this process: "kill {pid}" and create indexes:')
+                        log.l.log('\tCREATE INDEX planet_osm_ways_nodes_bucket_idx ON planet_osm_ways')
+                        log.l.log('\t\tUSING GIN (planet_osm_index_bucket(nodes))')
+                        log.l.log('\t\tWITH (fastupdate = off);')
                         printed_slow_warning=True
                     #see below, db forgets it. but don't rely on its forgetfulness
                     c.execute("SET statement_timeout=0;")
@@ -194,420 +184,8 @@ def regions_lookup(isocode:str) :
             if r_d[i].find(isocode)>=0 :
                 if r_d[i]==isocode :
                     return r_d[headers.index('name')],r_d[headers.index('osm_id')]
-    l.log_start(f'Error iso boundary not found: {isocode}')
+    log.l.log_start(f'Error iso boundary not found: {isocode}')
     exit(1)
-
-class Settings :
-    def __init__(self,args:argparse.Namespace) :
-        self.debug=args.debug
-        self.debug_xml=False
-
-        self.bounds_geojson=args.bounds_geojson
-        self.bounds_rel_id=args.bounds_rel_id
-        self.bounds_iso=args.bounds_iso
-        self.bounds_box=args.bounds_box
-
-        self.get_lonlat_binary=args.get_lonlat_binary
-        self.nodes_file=args.nodes_file
-
-        self.out_file=args.out_file
-        
-        self.access=psycopg2.connect(args.postgres_dsn)
-
-        self.has_suggested_out_filename=False #only print suggestion once
-        self.connect_and_check()
-
-    def connect_and_check(self) :
-        #use one cursor for everything
-        self.c=self.access.cursor()
-        self.c.execute('''SELECT f_table_name AS name,f_table_schema AS schema,
-                f_geometry_column AS geom,srid,
-                pg_table_size(f_table_name::text) AS size
-            FROM geometry_columns WHERE srid!=0''')
-        autodetect_tables=list(g_from_cursor(self.c))
-        self.c.execute('''SELECT tablename AS name,schemaname AS schema,
-                pg_table_size(tablename::text) AS size
-            FROM pg_tables WHERE schemaname NOT IN ('information_schema','pg_catalog')''')
-        autodetect_tables.extend(list(g_from_cursor(self.c)))
-        self.tables={}
-        geom_name_endings=('_point','_line','_polygon')
-        nongeom_name_endings=('_ways','_rels')
-        for row_dict in autodetect_tables :
-            name=row_dict['name']
-            n_end=None
-            test_endings=geom_name_endings if 'geom' in row_dict else nongeom_name_endings
-            for test_name_end in test_endings :
-                if name.endswith(test_name_end) :
-                    n_end=test_name_end
-            if n_end==None :
-                continue
-            name=row_dict['schema']+'.'+row_dict['name']
-            if n_end in self.tables and self.tables[n_end]['size']>row_dict['size']:
-                continue #take the biggest size table
-            self.tables[n_end]={'name':name,'size':row_dict['size']}
-            if 'geom' in row_dict :
-                self.tables[n_end]['srid']=row_dict['srid']
-                self.tables[n_end]['geom']=row_dict['geom']
-
-        if self.debug :
-            print('s.tables=',self.tables,file=sys.stderr)
-        for key in ('_point','_line','_polygon','_ways','_rels') :
-            assert key in self.tables and isinstance(self.tables[key],dict), 'Could not autodetect which tables contain the data'
-
-        j_schema=list(get_columns_of_types(self.c,('jsonb',),self.tables['_rels']['name']))
-        t_schema=list(get_columns_of_types(self.c,('_text',),self.tables['_rels']['name']))
-        self.new_jsonb_schema=len(j_schema)==2
-        if self.debug:
-            print('t_schema=',t_schema,'j_schema',j_schema,file=sys.stderr)
-        if self.new_jsonb_schema :
-            assert len(t_schema)==0, 'Could not decide which middle db schema is used'
-        else :
-            assert len(t_schema)==2, 'Could not decide which middle db schema is used'
-
-        l.log_start('INFO: detected middle database layout = '+('new jsonb' if self.new_jsonb_schema else 'legacy text[]'))
-        asyncio.run(self.test())
-
-
-    def make_bounds_constr(self,table_key:str)->typing.Collection[str] :
-        """ Lookup the table_key in self.tables and return the
-        "ST_Intersects(way, ST_MakeEnvelope(x1,y2,x2,y2))" part of a query for the specific
-        table table_key, and its fully qualified name. NOTE: avoid using && operator
-        because that only considers the bounding box hull of the boundary!
-        Also account for SRID differences (osm data usually stored in 3857, latlon is 4326)
-        with ST_Transform().
-        ALSO: bbox can be specified in addition to any of the other bounds: make an
-        intersection then
-        """
-        from_rel_id=False
-        tgt_srid=self.tables[table_key]['srid']
-        way_column=self.tables[table_key]['geom']
-        way_constr=None
-        if self.bounds_geojson!=None :
-            with open(self.bounds_geojson,'r') as f :
-                geojson=f.read().strip()
-            way_constr=f"ST_GeomFromGeoJSON('{geojson}'::jsonb)"
-            way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
-        elif self.bounds_rel_id!=None :
-            osm_rel_id=self.bounds_rel_id
-            from_rel_id=True
-        elif self.bounds_iso!=None :
-            c_name,osm_rel_id=regions_lookup(self.bounds_iso)
-            if not self.has_suggested_out_filename :
-                self.has_suggested_out_filename=True
-                l.log(f"Suggested output filename: '{c_name}.osm'")
-            osm_rel_id=int(osm_rel_id)
-            from_rel_id=True
-
-        if from_rel_id :
-            relbound_way_col=self.tables['_polygon']['geom']
-            relbound_name=self.tables['_polygon']['name'] #stores negative osm_ids for relations
-            assert tgt_srid==self.tables['_polygon']['srid'], 'Unsupported cross-table different geometry SRIDs'
-            #relation ids are stored negative
-            way_constr=f'(SELECT relbound.{relbound_way_col} FROM {relbound_name} AS relbound WHERE osm_id={-osm_rel_id})'
-            way_constr=f'ST_Intersects({way_column},{way_constr})'
-        
-        if self.bounds_box!=None and way_constr==None :
-            lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
-            way_constr=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
-            way_constr=f'ST_Intersects({way_column},ST_Transform({way_constr},{tgt_srid}))'
-        elif self.bounds_box!=None and way_constr!=None :
-            # INTERSECTION between already bounds and current bbox:
-            # actually doing an ST_IntersectION means postgresql cannot optimize it as well.
-            # the AND structure is much faster (and query planner agrees as well) ->
-            #   cost 1000x lower from 188'000 to 239
-            lon_from,lat_from,lon_to,lat_to=tuple(map(float,self.bounds_box.split(',')))
-            way_constr_bbox=f'ST_MakeEnvelope({lon_from}, {lat_from}, {lon_to}, {lat_to}, 4326)'
-            way_constr_bbox=f'ST_Intersects({way_column},ST_Transform({way_constr_bbox},{tgt_srid}))'
-            way_constr=f'{way_constr} AND {way_constr_bbox}'
-
-        if way_constr==None :
-            l.log('Error: no boundary provided.')
-            l.log("If you are sure to export the whole planet, use --bbox='-180,-89.99,180,89.99'")
-            exit(1)
-        return way_constr,self.tables[table_key]['name']
-
-    def main(self) :
-        """ Handle all the asyncio stuff for stream_osm_xml(), only returns when
-        everything is finished. Can be run multiple times
-        """
-        try :
-            t=asyncio.run(stream_osm_xml(self))
-        except ZeroDivisionError :
-            print('\nError: boundary is empty or database has no data within',file=sys.stderr)
-        sys.stderr.flush()
-
-    async def test(self) :
-        """ Test: checks if get_lonlat exsits, is executable.
-            And the get_lonlat execution will crash if planet.bin.nodes is
-            not readwrite or does not exist.
-        """
-        result=[]
-        async for i in get_latlon_str_from_flatnodes(('2185493801','3546766428'),self) :
-            result.append(i)
-        return result
-
-class ModuleSettings(Settings) :
-    """ Pass the stream_osm_xml() a ModuleSettings if you directly want to
-    give python objects instead of using the CLI and argparse
-        * supported feature: 'out_file' can be any open file python object
-    WARNING: danger zone, requirement is not checked! if you forget to set some
-    settings value, this script may crash just before the end!
-    """
-    def __init__(self,**kwargs):
-        #something not in keys will be ignored, dict value is DEFAULT value
-        keys={'debug':False,'debug_xml':False,'bounds_geojson':None,
-                'bounds_rel_id':None,'bounds_iso':None,'bounds_box':None,
-                'get_lonlat_binary':None,'nodes_file':None,'out_file':None,
-                'access':None,'postgres_dsn':None,'has_suggested_out_filename':False,
-        }
-        for k,v in kwargs.items() :
-            if k in keys :
-                setattr(self,k,v)
-        for k,v in keys.items() :
-            if not hasattr(self,k) :
-                setattr(self,k,v)
-        self.connect_and_check()
-
-class Logger() :
-    def __init__(self) :
-        self._ready=False
-        self.previous_prependline=False
-        self.previous_clearline=None
-        #os.get_terminal_size() will error out when .isatty() is false.
-        # instead of calling isatty() on each line, save it one at program start
-        # (because it does not change)
-        try :
-            #sys.stderr.isatty() seems to return True when <prog>|tail -f /dev/stdin
-            self.isatty=os.get_terminal_size().columns>0
-        except OSError :
-            self.isatty=False
-
-    def check_ready(self) :
-        assert self._ready, 'Need to run .set_phases first'
-    def set_phases(self,phases:typing.Collection[str]) :
-        self.phases=phases
-        self.str_maxlen_phase=max(list(map(len,phases)))
-        self.current_phase=0 #index into phases list
-        self._ready=True
-
-    def next_phase(self) :
-        self.check_ready()
-        self.current_phase+=1
-        if self.current_phase>=len(self.phases) :
-            self.current_phase=0
-            l.log(f'WARNING: Called .next_phase() too many times with {self.phases}. resetting')
-
-    def save_clearedline(self) :
-        ''' Simply write a newline at the end of the previous clearline: save it.
-        Warning, will garble output if not preceded by a clearline=True log call.
-        '''
-        print(end='\n',file=sys.stderr)
-        sys.stderr.flush()
-        #same behaviour whether followed by a clearline or not
-        self.previous_clearline=False
-
-    def log(self,*msg:typing.Any,clearline=False,prependline=False) :
-        ''' Like print, accept a list of Any-typed items and print their .__str__()
-        space-separated. Keeps track of the current phase.
-        clearline==True will clear the line. Use when in a loop to display a counter going up
-        prependline==True will not clear the line but leave the end without a newline.
-            Use just before a .log(clearline=True) to add information before
-        '''
-        #self.check_ready() dont't for performance reasons
-        assert int(clearline)+int(prependline)<2, 'not both clearline and prependline can be True'
-        str_msg=' '.join(map(str,msg))
-        l=self.str_maxlen_phase+5
-        phase=str(self.current_phase+1)+'/'
-        phase+=str(len(self.phases))
-        phase+=' '+self.phases[self.current_phase]
-        # a clearline will trigger clearing the line EXCEPT when the previous log was a prependline
-        # -- OR --
-        # two prependlines after eachother will trigger clearing the line: the newer erases the older
-        should_flush=False
-        if ((prependline or clearline) and not self.previous_prependline) or (self.previous_prependline and prependline):
-            should_flush=True
-            print(end='\r',file=sys.stderr)
-        if not (clearline or prependline) and self.previous_clearline :
-            should_flush=True
-            print(file=sys.stderr) #reset clearline
-        #a bit crazy syntax, but I want the field length to be variably dependent on self.str_maxlen_phase
-        if not self.previous_prependline :
-            # f-string will make -> '{:<13}'
-            # str.format will do -> 'one          '
-            str_msg=f'[ {{:<{l}}}] {{}}'.format(phase,str_msg)
-        # \033[2K erasing the line makes a flicker, this should not
-        # by just printing over with spaces, until end of terminal. it WILL get meesed up if you
-        # resize the terminal while it's printing a progress...
-        str_msg+=' '*((os.get_terminal_size().columns if self.isatty else 80)-len(str_msg))
-        print(str_msg,end=('' if clearline else ' ' if prependline else '\n'),file=sys.stderr)
-        self.previous_prependline=prependline
-        self.previous_clearline=clearline
-        if should_flush :
-            sys.stderr.flush()
-
-    def log_start(self,str_msg) :
-        print('[ start ]',str_msg,file=sys.stderr)
-
-class RateLogger(Logger) :
-    """ Subclass of Logger because it reuses its .log() and various functions.
-    Also a drop-in replacement to Logger but with additional .rate()
-    Usage: normal like Logger, but 4 rate functions available: simplerate, rate, doublerate and
-    triplerate. Calling one of those functions at every loop iteration with progress
-    numbers will then print a progress bar with a custom message, and a rate (e.g 4.6M/s) of processed
-    items.
-    * NOTE: Need to call self.finishrate() at the end of the loop, to allow for other rate progress
-    bars to be printed.
-    * NOTE: calling self.log during a rate loop is also supported.
-    """
-    def __init__(self) :
-        super().__init__()
-        self.samples=[]
-        self.times=[]
-        self.sample_length=10_000
-        self.min_time_interval_s=0.05
-        self.prev_print_t=0
-        self.prev_args=[]
-
-    def check(self)->bool :
-        """ Only calculate and print to console at time-distanced intervals.
-        This is both because printing a lot will stress the stdout buffer (wasting CPU)
-        and produce multiple megabytes of (useless) text output if piped to a file.
-        Also calculating the average is not needed at every call of one of the rate functions.
-        Use self.min_time_interval_s (50ms) as the minimal time between two calculate_avg+print
-        steps.
-        """
-        t=time.time()
-        if (t-self.prev_print_t)>self.min_time_interval_s :
-            self.prev_print_t=t
-            return True
-        return False
-
-    def samples_append(self,n:tuple) :
-        """ The data in n is intended for a rate measurement: so also keep self.times
-        updated. To prevent wasting memory, calculate a rolling average over the last
-        self.sample_length (10'000) samples only. A total average would also be possible
-        (and only require storing 1 value) but less expressive of "live"
-        changes (Start some cpu-heavy background job-> the rate falls).
-        """
-        if len(self.samples)>=self.sample_length :
-            self.samples.pop(0)
-            self.times.pop(0)
-        self.samples.append(n)
-        self.times.append(time.time())
-
-    def ratefmt(self,r:float) :
-        ''' Return str(r) with 3 sigfigs
-        '''
-        for i,letter in ((1e12,'T'),(1e9,'G'),(1e6,'M'),(1e3,'K'),(1,'')) :
-            if r>i or i==1: #give up at <1.0 point
-                tgt=r/i
-                # ljust for 3 -> 3.00
-                if tgt<1.0 :
-                    return str(round(tgt,3)).ljust(5,'0')+letter
-                elif tgt<10.0 :
-                    return str(round(tgt,2)).ljust(4,'0')+letter
-                elif tgt<100.0 :
-                    return str(round(tgt,1)).ljust(4,'0')+letter
-                else :
-                    return str(round(tgt)).ljust(3,'0')+letter
-    
-    def simplerate(self,count:int,msg:str,tot:int,lastline=False) :
-        """ Show a rate progress bar on count from tot items in format:
-            '{count} ({count_rate}/s) / {tot} {msg}    {percent:count/tot}%'
-        """
-        self.is_simplerate=True
-        if count>1e6 :
-            #set higher for a smoother rate display
-            self.sample_length=100_000
-        if not lastline :
-            self.samples_append((count,))
-        self.prev_args=(count,msg,tot)
-        if self.check() or lastline :
-            t_diff=self.times[-1]-self.times[0]
-            if t_diff>1e-5 :
-                #calculate avg
-                r_a=(self.samples[-1][0]-self.samples[0][0])/t_diff
-                r_s_a='('+self.ratefmt(r_a)+'/s)'
-            else :
-                r_s_a='(0/s)'
-            l=(n(count),r_s_a+' / '+n(tot),msg,'   ',self.percent(count,tot),)
-            self.log(*l,clearline=True)
-
-    def rate(self,a:int,msg:str,count:int,total:int) :
-        """ Show a rate progress bar on a for items from count to tot in format:
-            '{a} ({a_rate}/s) {msg} {count} / {tot}   {percent:count/tot}%'
-            This is useful when processing item count from total, producing a variable
-            amount of sub-items, of which that other total is a (and total_a is unknowable)
-        """
-        self.multirate((a,),(msg,),count,total)
-
-    def triplerate(self,a:int,a_msg:str,b:int,b_msg:str,c:int,c_msg:str,count:int,total:int) :
-        """ Like .rate() ,show a rate progress bar on a for items from count to tot in format:
-        But use three counts: a, b and c
-            '{a} ({a_rate}/s) {a_msg} {b} ({b_rate}/s) {b_msg} {c} {c_rate/s} {c_msg} {count} / {tot}   {percent:count/tot}%'
-        """
-        self.multirate((a,b,c,),(a_msg,b_msg,c_msg,),count,total)
-
-    def doublerate(self,a:int,a_msg:str,b:int,b_msg:str,count:int,total:int) :
-        """ Like .rate() ,show a rate progress bar on a for items from count to tot in format:
-        But use two counts: a and b
-            '{a} ({a_rate}/s) {a_msg} {b} ({b_rate}/s) {b_msg} {count} / {tot}   {percent:count/tot}%'
-        """
-        self.multirate((a,b,),(a_msg,b_msg,),count,total)
-
-    def multirate(self,ns:typing.Tuple[int],msgs:typing.Tuple[str],count:int,total:int,lastline=False) :
-        """ Generalized version of .rate(), .doublerate() and .triplerate(). Those functions just
-        reshuffle the arguments so that calling them has the args arranged in an order similar to
-        how they will be printed out. Not .simplerate() though, it is separate.
-        """
-        self.is_simplerate=False
-        if ns[0]>1e6 :
-            self.sample_length=100_000
-        if not lastline :
-            self.samples_append(ns)
-        self.prev_args=(ns,msgs,count,total)
-        if self.check() or lastline:
-            t_diff=self.times[-1]-self.times[0]
-            if t_diff>1e-5 :
-                #calculate avg
-                rs=[(self.samples[-1][ix]-self.samples[0][ix])/t_diff for ix,_ in enumerate(ns)]
-                r_ss=['('+self.ratefmt(rs[ix])+'/s)' for ix,_ in enumerate(ns)]
-            else :
-                r_ss=['(0/s)' for ix in enumerate(ns)]
-            rates=[j for ix,i in enumerate(ns) for j in (n(i),r_ss[ix],msgs[ix])]
-            l=(*rates,n(count)+' / '+n(total),'   ',self.percent(count,total),)
-            self.log(*l,clearline=True)
-
-    def finishrate(self,lastline=True) :
-        """ Any currently running rate printer (simplerate,rate,doublerate,triplerate)
-        has finished (for loop has ended) : reset counters and data storage.
-        When lastline=False, do NOT calculate+print the final "summary 100%" line
-        """
-        if lastline :
-            #last line print
-            if self.is_simplerate :
-                self.simplerate(*self.prev_args,lastline=True)
-            else :
-                self.multirate(*self.prev_args,lastline=True)
-            self.save_clearedline()
-        #reset rate measurement
-        self.samples=[]
-        self.times=[]
-        self.prev_print_t=0
-        self.prev_args=None
-        self.sample_length=10_000
-
-    def percent(self,numer:int,denom:int)->str :
-        ''' Return the str(float(numer/denom)*100) with 3 sigfigs,
-        '''
-        r=numer/denom*100
-        # ljust for 3.0 -> 3.00
-        if r<1.0 :
-            return str(round(r,3)).ljust(5,'0')+'%'
-        elif r<10.0 :
-            return str(round(r,2)).ljust(4,'0')+'%'
-        else :
-            return str(round(r,1)).ljust(3,'0')+'%'
 
 async def chain(*generators:typing.Iterator)->typing.Iterator:
     for g in generators :
@@ -620,63 +198,44 @@ async def chain(*generators:typing.Iterator)->typing.Iterator:
             async for i in g :
                 yield i
 
-async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],
-        s:Settings)->typing.Iterator :
-    a=await asyncio.create_subprocess_exec(s.get_lonlat_binary,s.nodes_file,
-        stdout=asyncio.subprocess.PIPE,stdin=asyncio.subprocess.PIPE)
-    # some osm_ids may error out. in that case get_lonlat just ignores them.
-    # therefore, take the output osm_id as source of truth.
 
-    # the last character is important: NOT number data but a separator.
-    for i in osm_ids :
-        a.stdin.write((str(i)+'\n').encode())
-    #just to be sure
-    a.stdin.write(b'\n')
-    a.stdin.close()
-    #read all results
-    while (line:=(await a.stdout.readline()).strip().decode()) :
-        #l.log('read line',line)
-        x,y,osm_id=line.split(';')
-        #beware, need to exchange lonlat -> latlon
-        yield (osm_id,y,x)
-
-def all_nwr_within(s:Settings,a:Accumulator) :
+def all_nwr_within(s:settings.Settings,a:Accumulator) :
     #SELECT workflow to get all element [ids ONLY] in bounding box or boundary:
     # 1a) select all nodes WHERE way ST_Within(bbox);
     constr,tbl_name=s.make_bounds_constr('_point')
-    l.log('executing big query on',tbl_name,'...',clearline=True)
+    log.l.log('executing big query on',tbl_name,'...',clearline=True)
     s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
-    for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
+    for row in dbutils.g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         a.add('nodes',row['osm_id'])
-    l.log(n(a.len('nodes')),'nodes within bounds')
+    log.l.log(log.n(a.len('nodes')),'nodes within bounds')
 
     # 1b) select all ways,rels FROM planet_osm_polygon WHERE way ST_Within(bbox);
     constr,tbl_name=s.make_bounds_constr('_polygon')
-    l.log('executing big query on',tbl_name,'...',clearline=True)
+    log.l.log('executing big query on',tbl_name,'...',clearline=True)
     s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
-    for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
+    for row in dbutils.g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         id=row['osm_id']
         if id>0 :
             a.add('ways',id)
         else :
             a.add('rels',-id)
-    l.log(n(a.len('ways')),'ways,',n(a.len('rels')),'rels from',tbl_name)
+    log.l.log(log.n(a.len('ways')),'ways,',log.n(a.len('rels')),'rels from',tbl_name)
 
     # 1c) select all ways,rels FROM planet_osm_line WHERE way ST_Within(bbox);
     # planet_osm_roads is not needed in that fashion, because it is a strict subset
     # of planet_osm_line
     constr,tbl_name=s.make_bounds_constr('_line')
-    l.log('executing big query on',tbl_name,'...',clearline=True)
+    log.l.log('executing big query on',tbl_name,'...',clearline=True)
     s.c.execute(f'SELECT osm_id FROM {tbl_name} WHERE {constr};')
-    for row in g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
+    for row in dbutils.g_from_cursor(s.c,verbose=True,prefix_msg=tbl_name+' ') :
         id=row['osm_id']
         if id>0 :
             a.add('ways',id)
         else :
             a.add('rels',-id)
-    l.log(n(a.len('ways')),'ways,',n(a.len('rels')),'rels within bounds')
+    log.l.log(log.n(a.len('ways')),'ways,',log.n(a.len('rels')),'rels within bounds')
 
-def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
+def nodes_parent_wr(s:settings.Settings,a:Accumulator,only_nodes_within=False) :
     # 2a) foreach node_id :
     # 2b) select all ways WHERE ARRAY[node_id]::bigint[] <@ nodes;
     # 2c) select all rels WHERE ARRAY[node_id]::bigint[] <@ parts;
@@ -715,17 +274,17 @@ def nodes_parent_wr(s:Settings,a:Accumulator,only_nodes_within=False) :
                 rels_query),
             [(lambda i:','.join(map(str,i)),),rels_lambdas]) :
         node_count+=node_c
-        l.doublerate(way_count,'ways',rel_count,'rels parents of node',node_count,a_len(nodes_name))
+        log.l.doublerate(way_count,'ways',rel_count,'rels parents of node',node_count,a_len(nodes_name))
         for way in way_ids:
             way_count+=1
             a.add('ways',way['id'])
         for rel in rel_ids:
             rel_count+=1
             a.add('rels',rel['id'])
-    l.finishrate()
-    l.log(n(a_len('ways')),'ways,',n(a_len('rels')),'rels forward from nodes')
+    log.l.finishrate()
+    log.l.log(log.n(a_len('ways')),'ways,',log.n(a_len('rels')),'rels forward from nodes')
 
-def ways_parent_r(s:Settings,a:Accumulator) :
+def ways_parent_r(s:settings.Settings,a:Accumulator) :
     # 3a) foreach way_id :
     # 3b) select all rels WHERE ARRAY[way_id]::bigint[] <@ parts;
     way_count=0
@@ -750,11 +309,11 @@ def ways_parent_r(s:Settings,a:Accumulator) :
         for rel in rel_ids:
             rel_count+=1
             a.add('rels',rel['id'])
-        l.rate(rel_count,'rels parents of way',way_count,a_len('ways'))
-    l.finishrate(lastline=False)
-    l.log(a_len('rels'),'rels forward')
+        log.l.rate(rel_count,'rels parents of way',way_count,a_len('ways'))
+    log.l.finishrate(lastline=False)
+    log.l.log(a_len('rels'),'rels forward')
 
-def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,without_rels=False) :
+def rels_children_nwr(s:settings.Settings,a:Accumulator,only_multipolygon_rels=False,without_rels=False) :
     ''' Going over all rel ids in accumulator, read every rel's members[] array and add all its
     children, according to their type: node/way/relation, to the accumulator.
     without_rels==True means to disregard the rel's children that are rels.
@@ -784,7 +343,7 @@ def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,with
             #for row in g_query_ids()
             tot_count+=1
             s.c.execute(f'SELECT members FROM {tbl_rels} WHERE id={rel_id}{multipolygon_constr};')
-            for row in g_from_cursor(s.c) :
+            for row in dbutils.g_from_cursor(s.c) :
                 ms=row['members']
                 if s.new_jsonb_schema :
                     for m in ms :
@@ -820,18 +379,18 @@ def rels_children_nwr(s:Settings,a:Accumulator,only_multipolygon_rels=False,with
                             raise ValueError(f'''Encountered invalid members[]
                                 element of rel id {rel_id} in members={repr(ms)}
                                 at index [{i}]={repr(ms[i])}''')
-            l.triplerate(node_count,'nodes',way_count,'ways',rel_count,'rels children of rel',
+            log.l.triplerate(node_count,'nodes',way_count,'ways',rel_count,'rels children of rel',
                     tot_count,a_len('rels'))
         if without_rels :
             #l.save_clearedline()
-            l.finishrate()
+            log.l.finishrate()
             return #after first run
         for rel_id in buffer_add_rels :
             a.add('rels',rel_id)
         tot_count=0 #reset counter to make only count up to 100% not 200%
-    l.finishrate()
+    log.l.finishrate()
 
-def ways_children_n(s:Settings,a:Accumulator) :
+def ways_children_n(s:settings.Settings,a:Accumulator) :
     a_len=a.len
     # 4b) foreach way_id: add all its nodes[] ids
     way_count=0
@@ -839,18 +398,18 @@ def ways_children_n(s:Settings,a:Accumulator) :
     for way_id in a.all('ways') :
         way_count+=1
         s.c.execute(f'SELECT id,nodes FROM {s.tables["_ways"]["name"]} WHERE id={way_id};')
-        for row in g_from_cursor(s.c) :
+        for row in dbutils.g_from_cursor(s.c) :
             for i in row['nodes'] :
                 a.add('nodes',i)
                 if i==122317 :
-                    l.log('n122317 is in',a.is_in('nodes',122317))
-                    l.log('FROM way',row['id'],'which has',len(row['nodes']),'nodes')
+                    log.l.log('n122317 is in',a.is_in('nodes',122317))
+                    log.l.log('FROM way',row['id'],'which has',len(row['nodes']),'nodes')
                 node_count+=1
-        l.rate(node_count,'nodes children of way',way_count,a_len('ways'))
-    l.finishrate()
+        log.l.rate(node_count,'nodes children of way',way_count,a_len('ways'))
+    log.l.finishrate()
 
 
-async def stream_osm_xml(s:Settings) :
+async def stream_osm_xml(s:settings.Settings) :
     ''' Query osm2pgsql-imported postgres database for nodes, ways and rels and stream
     an xml representation of them into s.out_file. Attempts to select objects that are in
     the given bounds. But the dependencies are sometimes required, so more data that just
@@ -858,13 +417,13 @@ async def stream_osm_xml(s:Settings) :
     any way.
     See --help for s.bounds.
     '''
-    l.log_start(time.strftime('%F_%T'))
+    log.l.log_start(time.strftime('%F_%T'))
     ## TODO: move this config to Settings
     with_parents=True
     phases=['within','children','parents','write']
     if not with_parents :
         phases.remove('parents')
-    l.set_phases(phases)
+    log.l.set_phases(phases)
 
     #nodes within are a subset of nodes: copy of nodes just after all_nwr_within was run
     a=DictAccumulator(('nodes','nodes_within','ways','rels','done_ids'))
@@ -876,7 +435,7 @@ async def stream_osm_xml(s:Settings) :
     for i in a.all('nodes') :
         a.add('nodes_within',i)
 
-    l.next_phase() #children
+    log.l.next_phase() #children
 
     ## TODO: move config to Settings
     # [+0K nodes, +60K ways, +0K rels] only_multipolygon_rels=True,without_rels=True
@@ -886,14 +445,14 @@ async def stream_osm_xml(s:Settings) :
     # we now have: [~3.3M nodes, ~350K ways, ~7K rels]
 
     if with_parents :
-        l.next_phase() #parents
+        log.l.next_phase() #parents
         # [+40K ways, +1K rels]
         nodes_parent_wr(s,a,only_nodes_within=True)
         #ways_parent_r(s,a)
 
-    l.next_phase() #write
+    log.l.next_phase() #write
     counts=[a.len(i)for i in ('nodes','ways','rels')]
-    l.log('dumping',n(counts[0]),'nodes,',n(counts[1]),'ways,',n(counts[2]),'rels in total')
+    log.l.log('dumping',log.n(counts[0]),'nodes,',log.n(counts[1]),'ways,',log.n(counts[2]),'rels in total')
     # we now have: [~3.3M nodes, ~400K ways, ~8K rels] with_parents=True
 
     # ONLY after all ids have been resolved, do we actually query the data,
@@ -904,8 +463,9 @@ async def stream_osm_xml(s:Settings) :
         xml_out.write_declaration()
         with xml_out.element('osm',{
             'version':'0.6',
-            'generator':time.strftime(f'pgsql2osm.py v{VERSION} %F'),
-            'url':'https://github.com/feludwig/pgsql2osm/pgsql2osm.py',
+            'generator':f'{__package__} v{__version__}',
+            'at_time':time.strftime(f'%F_%T'),
+            'url':s.project_url,
         }) :
             async for el in chain(
                     create_nodes(s,a),
@@ -943,7 +503,7 @@ def rel_to_xml(row_dict:dict,tags:dict,new_jsonb_schema:bool)->ET.Element :
                 have_keys.add(k)
     return rel
 
-def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
+def create_relations(s:settings.Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     ''' Read all ids from accumulator, under a.all('rels') and fetch corresponding
     data from database.
     Use the accumulator 'done_ids' for checking what was done and what needs to be done.
@@ -957,7 +517,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     len_ids=a_len('rels')
 
     table_name=s.tables['_polygon']['name']
-    l.log('reading table',table_name,'...')
+    log.l.log('reading table',table_name,'...')
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         # we need to merge the _polygon tags with the _rels tags.
@@ -967,7 +527,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         # do we need this ? no ; especially the tags->'area'='yes' will overwrite 'area' if it exists
         #f'{table_name}.way_area AS area',
         #I think real does not exist and real->float4
-        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+        *list(dbutils.get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))
     query+=f',{tbl_rels}.members FROM {table_name} JOIN {tbl_rels}'
@@ -982,7 +542,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     # store the negatives copy as well
     if s.debug_xml :
         yield ET.Element('debug',{'status':'starting polygon query'})
-    for row_dict in g_query_ids(s.c,query,g_negate(a.all('rels')),'osm_id',step=250) :
+    for row_dict in dbutils.g_query_ids(s.c,query,g_negate(a.all('rels')),'osm_id',step=250) :
         if a.is_in('done_ids',row_dict['id']) :
             continue
         #collapse hstore tags 
@@ -994,19 +554,19 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'done_ids_len':str(a_len('done_ids')),'ids_len':str(len_ids),
                 'table':table_name})
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'rels',len_ids)
-        #l.log(n(a_len('done_ids')),'/',n(len_ids),'rels','    ',
+        log.l.simplerate(a_len('done_ids'),'rels',len_ids)
+        #l.log(log.n(a_len('done_ids')),'/',log.n(len_ids),'rels','    ',
         #        percent(a_len('done_ids'),len_ids),clearline=True)
-    l.finishrate()
+    log.l.finishrate()
 
     #and now with _line as well
     table_name=s.tables['_line']['name']
-    l.log('reading table',table_name,'...')
+    log.l.log('reading table',table_name,'...')
 
     read_columns=[f'-{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         #f'{tbl_rels}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_rels}.tags::hstore) AS json_tags2',
-        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+        *list(dbutils.get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     
     #TEMP: there seems to be no index on _line! so we do additional queries one by one when double_query_mode==True
@@ -1044,7 +604,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     if s.debug_xml :
         yield ET.Element('debug',{'status':'starting line query'})
     first=True
-    for row_dict in g_query_ids(s.c,query,g_negate(a.all_subtract('rels','done_ids')),'osm_id',step=250) :
+    for row_dict in dbutils.g_query_ids(s.c,query,g_negate(a.all_subtract('rels','done_ids')),'osm_id',step=250) :
         if first :
             start_t=time.time()
             #l.log('rels _line output start',start_t)
@@ -1067,14 +627,14 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'done_ids_len':str(a_len('done_ids')),'ids_len':str(len_ids),
                 'table':table_name})
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'rels',len_ids)
+        log.l.simplerate(a_len('done_ids'),'rels',len_ids)
     if first :
         #edgecase when query returned 0 items
         start_t=time.time()
-    l.log('rels _line output end',(time.time()-start_t))
+    log.l.log('rels _line output end',(time.time()-start_t))
 
     table_name=tbl_rels
-    l.log('reading table',table_name,'...')
+    log.l.log('reading table',table_name,'...')
     if s.new_jsonb_schema :
         query=f'SELECT id,members,tags AS json_tags FROM {table_name}'
     else :
@@ -1084,7 +644,7 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     # which have no interesting tags regarding rendering making them worthy of a place in _polygon or _line
     if s.debug_xml :
         yield ET.Element('debug',{'status':'starting rels query'})
-    for row_dict in g_query_ids(s.c,query,a.all_subtract('rels','done_ids'),'id',step=300) :
+    for row_dict in dbutils.g_query_ids(s.c,query,a.all_subtract('rels','done_ids'),'id',step=300) :
         if a.is_in('done_ids',row_dict['id']) :
             continue
         #collapse hstore tags 
@@ -1095,8 +655,8 @@ def create_relations(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
                 'done_ids_len':str(a_len('done_ids')),'ids_len':str(len_ids),
                 'table':table_name})
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'rels',len_ids)
-    l.finishrate()
+        log.l.simplerate(a_len('done_ids'),'rels',len_ids)
+    log.l.finishrate()
     a.clear('rels')
 
 def way_to_xml(row_dict:dict,tags:dict)->ET.Element :
@@ -1116,7 +676,7 @@ def way_to_xml(row_dict:dict,tags:dict)->ET.Element :
                 have_keys.add(k)
     return way
 
-def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
+def create_ways(s:settings.Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     tbl_ways=s.tables['_ways']['name']
     table_name=s.tables['_polygon']['name']
     a_add=a.add
@@ -1125,20 +685,20 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     a.clear('done_ids')
     len_ids=a_len('ways')
 
-    l.log('reading table',table_name,'...')
+    log.l.log('reading table',table_name,'...')
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags', #polygons stores a hstore even in the new_jsonb_schema
         f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
         # do we need this ? no
         #f'{table_name}.way_area AS area',
         #I think real does not exist and real->float4
-        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+        *list(dbutils.get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))
     query+=f',{tbl_ways}.nodes FROM {table_name} JOIN {tbl_ways}'
     query+=f' ON {table_name}.osm_id={tbl_ways}.id'
 
-    for row_dict in g_query_ids(s.c,query,a.all('ways'),'osm_id') :
+    for row_dict in dbutils.g_query_ids(s.c,query,a.all('ways'),'osm_id') :
         if a.is_in('done_ids',row_dict['id']) :
             continue
         #collapse hstore tags 
@@ -1146,21 +706,21 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
         yield way_to_xml(row_dict,tags)
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'ways',len_ids)
+        log.l.simplerate(a_len('done_ids'),'ways',len_ids)
 
     #and now with _line
     table_name=s.tables['_line']['name']
-    l.log('reading table',table_name,'...')
+    log.l.log('reading table',table_name,'...')
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         f'{tbl_ways}.tags AS json_tags2' if s.new_jsonb_schema else f'hstore_to_json({tbl_ways}.tags::hstore) AS json_tags2',
-        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
+        *list(dbutils.get_columns_of_types(s.c,('int4','int','int8','int16','text','real','float4','float8'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))
     query+=f',{tbl_ways}.nodes FROM {table_name} JOIN {tbl_ways}'
     query+=f' ON {table_name}.osm_id={tbl_ways}.id'
 
-    for row_dict in g_query_ids(s.c,query,a.all_subtract('ways','done_ids'),'osm_id') :
+    for row_dict in dbutils.g_query_ids(s.c,query,a.all_subtract('ways','done_ids'),'osm_id') :
         if a.is_in('done_ids',row_dict['id']) :
             continue
         #collapse hstore tags 
@@ -1168,103 +728,30 @@ def create_ways(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         tags={**tags,**row_dict.pop('json_tags2')} if 'json_tags2' in row_dict else tags
         yield way_to_xml(row_dict,tags)
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'ways',len_ids)
+        log.l.simplerate(a_len('done_ids'),'ways',len_ids)
 
     #everything else was queried, only _ways remains
     table_name=tbl_ways
-    l.log('reading table',table_name,'...')
+    log.l.log('reading table',table_name,'...')
     #in this table, tags::text[], not yet a hstore
     if s.new_jsonb_schema :
         query=f'SELECT id,nodes,tags AS json_tags FROM {table_name}'
     else :
         query=f'SELECT id,nodes,hstore_to_json(tags::hstore) AS json_tags FROM {table_name}'
-    for row_dict in g_query_ids(s.c,query,a.all_subtract('ways','done_ids'),'id') :
+    for row_dict in dbutils.g_query_ids(s.c,query,a.all_subtract('ways','done_ids'),'id') :
         if a.is_in('done_ids',row_dict['id']) :
             continue
         #collapse hstore tags 
         tags=row_dict.pop('json_tags') if 'json_tags' in row_dict else {}
         yield way_to_xml(row_dict,tags)
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'ways',len_ids)
-    l.finishrate()
+        log.l.simplerate(a_len('done_ids'),'ways',len_ids)
+    log.l.finishrate()
     a.clear('ways')
 
 def g_negate(g:typing.Iterator[int]) :
     for i in g :
         yield -i
-
-def g_from_cursor(c:psycopg2.extensions.cursor,verbose=False,prefix_msg='')->typing.Iterator[dict]:
-    ''' Assuming the query has already c.execute()d, return its results
-    as a dict-generator'''
-    columns=[i.name for i in c.description]
-    tot_count=c.rowcount
-    count=1 # for human display
-    while (row:=c.fetchone())!=None :
-        if verbose :
-            l.simplerate(count,prefix_msg+'row',tot_count)
-        yield {k:v for k,v in zip(columns,row) if v!=None}
-        count+=1
-    if verbose:
-        l.finishrate()
-        #count-=1
-        #l.log(prefix_msg+'row',n(count),'/',n(tot_count),'    ',percent(count,tot_count),clearline=True)
-
-def g_query_ids(c:psycopg2.extensions.cursor,query:str,ids:typing.Iterator[int],
-        id_col:str,step=1000,verbose=False)->typing.Iterator[dict] :
-    ''' Given an SQL query without the ending semicolon and where the last
-    clause is a WHERE, append AND {id_col} IN (*ids) and yield those results.
-    The parenthesizing should be made explicit, NO GUARANTEER in this case:
-    [...] WHERE condA OR condB -> [...] WHERE condA OR condB AND id IN ([...])
-    -> SHOULD write [...] WHERE (condA OR condB)
-    A psql syntax error will be thrown if ORDER BY, LIMIT are the last clause.
-    '''
-    init_query=query
-    # case of 'SELECT ... FROM table' -> 'SELECT .. FROM table WHERE {append_query}'
-    with_and='AND'
-    if init_query.find('WHERE')<0 :
-        init_query+=' WHERE'
-        with_and='' #remove the AND
-
-    finished=False
-    while not finished :
-        #fetch step many values
-        buf=[]
-        for i in range(step) :
-            try :
-                buf.append(str(next(ids)))
-            except StopIteration :
-                finished=True # out of the while
-                break #out of the for 
-        if len(buf)==0 :
-            continue
-        query=f'{init_query} {with_and} {id_col} IN ('
-        query+=','.join(buf)
-        query+=');'
-        if verbose :
-            l.log(query)
-        c.execute(query)
-        if verbose :
-            l.log('query returned',c.rowcount,'rows')
-        yield from g_from_cursor(c)
-
-def get_columns_of_types(c:psycopg2.extensions.cursor,
-        col_types:typing.Collection[str],table_full_name:str)->typing.Iterator[str] :
-    values_col_types=",".join(["'"+i+"'" for i in col_types])
-    schema_name,table_name=table_full_name.strip('"').split('.')
-    c.execute(f'''
-    SELECT colname,strtype FROM 
-        (SELECT attname AS colname,
-            (SELECT typname FROM pg_type WHERE oid=atttypid) AS strtype
-        FROM pg_attribute WHERE attrelid=
-            (SELECT oid FROM pg_class WHERE relname='{table_name}'
-            AND relnamespace=(SELECT oid FROM pg_namespace
-                WHERE nspname='{schema_name}'
-            ))
-        ) AS columns
-    WHERE strtype IN ({values_col_types})
-        AND colname NOT IN ('osm_id');''')
-    for colname,strtype in c.fetchall() :
-        yield table_name+'.'+('"'+colname+'"' if colname.find(':')>0 else colname)
 
 def node_to_xml(row_dict:dict,tags:dict)->ET.Element :
     attrs,col_tags=split_tags_out(row_dict,('id','lat','lon'))
@@ -1292,7 +779,7 @@ def split_tags_out(row_dict:dict,keep_keys:typing.Collection[str])->typing.Colle
             tags[k]=v
     return (dest_dict,tags,)
 
-async def create_nodes(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
+async def create_nodes(s:settings.Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     table_name=s.tables['_point']['name']
     a.clear('done_ids')
     a_add=a.add
@@ -1300,16 +787,16 @@ async def create_nodes(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
     add_done_ids=lambda i:a_add('done_ids',i)
     len_ids=a_len('nodes')
 
-    l.log('reading table',table_name,'...',clearline=True)
+    log.l.log('reading table',table_name,'...',clearline=True)
     read_columns=[f'{table_name}.osm_id AS id',
         f'hstore_to_json({table_name}.tags) AS json_tags',
         f'ST_X(ST_Transform({table_name}.way,4326)) AS lon',
         f'ST_Y(ST_Transform({table_name}.way,4326)) AS lat',
-        *list(get_columns_of_types(s.c,('int4','int','int8','int16','text'),table_name))
+        *list(dbutils.get_columns_of_types(s.c,('int4','int','int8','int16','text'),table_name))
     ]
     query='SELECT '+(','.join(read_columns))+f' FROM {table_name}'
 
-    for row_dict in g_query_ids(s.c,query,a.all('nodes'),'osm_id') :
+    for row_dict in dbutils.g_query_ids(s.c,query,a.all('nodes'),'osm_id') :
         if a.is_in('done_ids',row_dict['id']) :
             continue
         # extract the json_tags into tags
@@ -1320,21 +807,21 @@ async def create_nodes(s:Settings,a:Accumulator)->typing.Iterator[ET.Element] :
         row_add={k:str(round(row_dict[k],10)) for k in ('lat','lon')}
         yield node_to_xml({**row_dict,**row_add},tags)
         add_done_ids(row_dict['id'])
-        l.simplerate(a_len('done_ids'),'nodes',len_ids)
-    l.finishrate()
-    l.log('now querying flatnodes file for missing nodes')
+        log.l.simplerate(a_len('done_ids'),'nodes',len_ids)
+    log.l.finishrate()
+    log.l.log('now querying flatnodes file for missing nodes')
     to_get_lat_lons=set()
 
     for batch in g_batches(a.all_subtract('nodes','done_ids'),5_000) :
-        async for osm_id,lat,lon in get_latlon_str_from_flatnodes(batch,s) :
+        async for osm_id,lat,lon in dbutils.get_latlon_str_from_flatnodes(batch,s) :
             #osm_id,lat and lon are already strings (don't bother to convert+reconvert them)
             osm_id_int=int(osm_id)
             if a.is_in('done_ids',osm_id_int) :
                 continue
             yield node_to_xml({'id':osm_id,'lat':lat,'lon':lon},{})
             add_done_ids(osm_id_int)
-            l.simplerate(a_len('done_ids'),'nodes',len_ids)
-    l.finishrate()
+            log.l.simplerate(a_len('done_ids'),'nodes',len_ids)
+    log.l.finishrate()
     a.clear('nodes')
 
 def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Collection] :
@@ -1352,45 +839,4 @@ def g_batches(generator:typing.Iterator,batch_size)->typing.Iterator[typing.Coll
         yield current_batch
 
 
-l=RateLogger() #global variable
 
-if __name__=='__main__' :
-    parser=argparse.ArgumentParser(prog='pgsql2osm')
-
-    parser.add_argument('get_lonlat_binary',
-        help="Path to the get_lonlat binary")
-    parser.add_argument('nodes_file',
-        help='Path to the nodes file created by osm2pgsql at import')
-    parser.add_argument('-d','--dsn',dest='postgres_dsn',
-        default='dbname=gis port=5432',
-        help="The connection string to pass to psycopg2, default '%(default)s'")
-
-    parser.add_argument('-b','--bbox',dest='bounds_box',
-        default=None,type=str,
-        help='''Rectangle boundary in the format lon_from,lat_from,lon_to,lat_to.
-Can be specified in addition to other boundaries, and will then extract the intersection.
-Info: use quotes with negative numbers, eg --bbox='-180,-89,180,89'.''')
-    #one of the following:
-    bounds_g=parser.add_mutually_exclusive_group(required=True)
-    bounds_g.add_argument('-r','--osm-rel-id',dest='bounds_rel_id',
-        default=None,type=int,
-        help='Integer for the osm relation that should make the boundary')
-    bounds_g.add_argument('-i','--iso',dest='bounds_iso',
-        default=None,
-        help='Country or region code for looking up in regions.csv, to determine boundary')
-    bounds_g.add_argument('-g','--geojson',dest='bounds_geojson',
-        default=None,
-        help='Geojson file for determining the boundary')
-
-    parser.add_argument('-o','--output',dest='out_file',
-        help="Path where the output .osm should be written to. When '-', write to stdout",
-        required=True)
-
-    parser.add_argument('--debug',dest='debug',default=False,
-        action='store_true',
-        help='Show additional debugging information')
-
-
-    args=parser.parse_args()
-    s=Settings(args)
-    s.main()

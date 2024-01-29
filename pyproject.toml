@@ -1,0 +1,18 @@
+[project]
+name = "pgsql2osm"
+version = "1.0"
+readme = "README.md"
+dependencies = [
+    "lxml",
+    "psycopg2-binary",
+]
+
+[tool.setuptools.package-data]
+pgsql2osm = ["*.txt", "*.csv"]
+
+[project.scripts]
+pgsql2osm = "pgsql2osm.cli:main"
+
+[project.urls]
+Homepage="https://github.com/feludwig/pgsql2osm"
+Issues="https://github.com/feludwig/pgsql2osm/issues"

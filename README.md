@@ -10,7 +10,7 @@ for rendering maps. How can you generate an extract
 to use with other cartography tools ?
 
 
-`pgsql2osm.py` is a script that can generate the XML in `.osm` format
+`pgsql2osm` is a python script that can generate the XML in `.osm` format
 for all entities within given boundaries.
 It attempts to preserve all data attributes from original osm data:
 nodes, ways and relations and all their `osm_id`s, all tags, and
@@ -25,10 +25,6 @@ for the Android
 app offline maps.
 
 ## Requirements
-
-* `python3`
-  - `pip install psycopg2`
-  - `pip install lxml`
 
 #### Database
 
@@ -62,7 +58,7 @@ ORDER BY pg_table_size(relname::text) DESC;
 * XML streaming output, allows to only store compressed .osm.bz2 on disk and not waste RAM.
 Example:
 ```
-python3 pgsql2osm.py --dsn 'dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2
+pgsql2osm --dsn 'dbname=gis' --iso fr --output -|bzip2 > France.osm.bz2
 ```
 * Attempt to lower RAM footprint with generators for database queries:
 streaming all the way from database to XML
@@ -150,6 +146,11 @@ it to `.osm` and then converting it back to `.osm.pbf` will most probably
 
 # Installation
 
+### `pgsql2osm`
+```
+pip install pgsql2osm
+```
+
 ### `get_lonlat` utility
 
 * Need to compile
@@ -172,18 +173,17 @@ g++ -std=c++17 ../src/get_lonlat.cpp ../src/node-persistent-cache.cpp \
 ### Run
 
 ```
-python3 pgsql2osm.py /path/to/get_lonlat /path/to/planet.bin.nodes --help
+pgsql2osm /path/to/get_lonlat /path/to/planet.bin.nodes --help
 ```
 For an overview of options
 
-# Python usage
+# Python module
 
-Also useable without the CLI, from another python script. Example:
+Made easier with the ModuleSettings class, example:
 
 ```
-#when pgsql2osm is a subdirectory
-import pgsql2osm.pgsql2osm as pgsql2osm
-m=pgsql2osm.ModuleSettings(
+import pgsql2osm
+m=pgsql2osm.settings.ModuleSettings(
   bounds_rel_id=osm_rel_id,
   get_lonlat_binary='/path/to/get_lonlat',
   nodes_file='/path/to/planet.bin.nodes',
