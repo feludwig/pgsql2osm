@@ -20,6 +20,7 @@ def n(i:int)->str :
 
 class Logger() :
     def __init__(self) :
+        self.pid=os.getpid()
         self._ready=False
         self.previous_prependline=False
         self.previous_clearline=None
@@ -233,7 +234,7 @@ class RateLogger(Logger) :
         has finished (for loop has ended) : reset counters and data storage.
         When lastline=False, do NOT calculate+print the final "summary 100%" line
         """
-        if lastline :
+        if lastline and self.prev_args is not None:
             #last line print
             if self.is_simplerate :
                 self.simplerate(*self.prev_args,lastline=True)

@@ -3,9 +3,28 @@
 import psycopg2
 import typing
 import asyncio
+import os
 
 from . import log
 
+
+def regions_lookup(isocode:str) :
+    isocode=isocode.upper().replace('_','-')
+    with open(os.path.dirname(__file__)+'/regions.csv') as f:
+        regions=f.read().strip().split('\n')
+    headers=regions.pop(0).split(',')
+    search_cols=[]
+    for ix,h in enumerate(headers) :
+        if h.find('iso')>=0 :
+            search_cols.append(ix)
+    for row in regions :
+        r_d=row.split(',')
+        for i in search_cols :
+            if r_d[i].find(isocode)>=0 :
+                if r_d[i]==isocode :
+                    return r_d[headers.index('name')],r_d[headers.index('osm_id')]
+    log.l.log_start(f'Error iso boundary not found: {isocode}')
+    exit(1)
 
 async def get_latlon_str_from_flatnodes(osm_ids:typing.Collection[int],s)->typing.Iterator :
     """ s is a settings.Settings object

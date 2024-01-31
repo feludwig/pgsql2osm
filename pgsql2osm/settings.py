@@ -4,16 +4,18 @@ import typing
 import argparse
 import psycopg2
 import asyncio
+import os
 import sys #maybe move all to log.py
 
 from . import pgsql2osm
 from . import dbutils
 from . import log
+from . import __metadata__
 
 
 class Settings :
     def __init__(self,args:argparse.Namespace) :
-        self.project_url='https://github.com/feludwig/pgsql2osm'
+        self.project_url=__metadata__['Project-URL']
 
         self.debug=args.debug
         self.debug_xml=False
@@ -26,7 +28,8 @@ class Settings :
         self.get_lonlat_binary=args.get_lonlat_binary
         self.nodes_file=args.nodes_file
 
-        self.out_file=args.out_file
+        #can either be a file-obj or a filename:str
+        self.out_file=sys.stdout.buffer if args.out_file=='-' else args.out_file
         
         self.access=psycopg2.connect(args.postgres_dsn)
 
@@ -107,7 +110,7 @@ class Settings :
             osm_rel_id=self.bounds_rel_id
             from_rel_id=True
         elif self.bounds_iso!=None :
-            c_name,osm_rel_id=regions_lookup(self.bounds_iso)
+            c_name,osm_rel_id=dbutils.regions_lookup(self.bounds_iso)
             if not self.has_suggested_out_filename :
                 self.has_suggested_out_filename=True
                 l.log(f"Suggested output filename: '{c_name}.osm'")
@@ -157,9 +160,18 @@ class Settings :
             And the get_lonlat execution will crash if planet.bin.nodes is
             not readwrite or does not exist.
         """
+        if not os.path.exists(self.get_lonlat_binary) :
+            raise BaseException(f'Did not find get_lonlat_binary at {self.get_lonlat_binary}')
+        #check that user=execute bit is set
+        elif not ((os.stat(self.get_lonlat_binary).st_mode>>6)%8)%2==1 :
+            raise BaseException(f'Seems not executable: get_lonlat_binary, please run "chmod +x {self.get_lonlat_binary}"')
+        if not os.path.exists(self.nodes_file) :
+            raise BaseException(f'Did not find nodes_file at {self.nodes_file}')
+
         result=[]
         async for i in dbutils.get_latlon_str_from_flatnodes(('2185493801','3546766428'),self) :
             result.append(i)
+        #WARNING: result may be empty and then what?
         return result
 
 class ModuleSettings(Settings) :
@@ -170,6 +182,7 @@ class ModuleSettings(Settings) :
     settings value, this script may crash just before the end!
     """
     def __init__(self,**kwargs):
+        self.project_url=__metadata__['Project-URL']
         #something not in keys will be ignored, dict value is DEFAULT value
         keys={'debug':False,'debug_xml':False,'bounds_geojson':None,
                 'bounds_rel_id':None,'bounds_iso':None,'bounds_box':None,

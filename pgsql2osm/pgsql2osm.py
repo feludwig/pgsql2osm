@@ -4,12 +4,7 @@ import lxml.etree as ET
 import time
 import psycopg2
 import typing
-import os
-import json
 import asyncio
-
-import sys
-import argparse
 
 from . import settings
 from . import dbutils
@@ -126,9 +121,8 @@ class Accumulator() :
                 if chunk_size==0 :
                     chunk_size=1 #well we just need to work with the slow database...
                     if not printed_slow_warning :
-                        pid=os.getpid()
                         log.l.log('WARNING: queries are running very slowly, the index may not exist.')
-                        log.l.log(f'\tplease kill this process: "kill {pid}" and create indexes:')
+                        log.l.log(f'\tplease kill this process: "kill {log.l.pid}" and create indexes:')
                         log.l.log('\tCREATE INDEX planet_osm_ways_nodes_bucket_idx ON planet_osm_ways')
                         log.l.log('\t\tUSING GIN (planet_osm_index_bucket(nodes))')
                         log.l.log('\t\tWITH (fastupdate = off);')
@@ -168,24 +162,6 @@ class DictAccumulator(Accumulator) :
                 missing.add(i)
         return iter(missing)
 
-
-def regions_lookup(isocode:str) :
-    isocode=isocode.upper().replace('_','-')
-    with open(os.path.dirname(__file__)+'/regions.csv') as f:
-        regions=f.read().strip().split('\n')
-    headers=regions.pop(0).split(',')
-    search_cols=[]
-    for ix,h in enumerate(headers) :
-        if h.find('iso')>=0 :
-            search_cols.append(ix)
-    for row in regions :
-        r_d=row.split(',')
-        for i in search_cols :
-            if r_d[i].find(isocode)>=0 :
-                if r_d[i]==isocode :
-                    return r_d[headers.index('name')],r_d[headers.index('osm_id')]
-    log.l.log_start(f'Error iso boundary not found: {isocode}')
-    exit(1)
 
 async def chain(*generators:typing.Iterator)->typing.Iterator:
     for g in generators :
@@ -458,8 +434,7 @@ async def stream_osm_xml(s:settings.Settings) :
     # ONLY after all ids have been resolved, do we actually query the data,
     # RAM-inefficient otherwise; more RAM-inefficient for bigger extracts.
     # do more of a streaming from database to file approach
-    out_file=sys.stdout.buffer if s.out_file=='-' else s.out_file
-    with ET.xmlfile(out_file,encoding='utf-8') as xml_out :
+    with ET.xmlfile(s.out_file,encoding='utf-8') as xml_out :
         xml_out.write_declaration()
         with xml_out.element('osm',{
             'version':'0.6',
